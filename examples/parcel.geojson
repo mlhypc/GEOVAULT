@@ -1,0 +1,13 @@
+{
+  "type": "Feature",
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [[
+      [35.300, 36.710],
+      [35.360, 36.760],
+      [35.310, 36.760],
+      [35.300, 36.710]
+    ]]
+  },
+  "properties": {"name": "example-triangle"}
+}

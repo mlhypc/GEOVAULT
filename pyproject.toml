@@ -1,0 +1,29 @@
+[project]
+name = "geovault"
+version = "0.1.0"
+description = "Research-grade satellite tile vault: acquire from free public sources, store lossless, query from anywhere"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "mlhypc" }]
+keywords = ["satellite", "sentinel", "stac", "cog", "tiles", "duckdb", "parquet"]
+
+dependencies = [
+    "duckdb>=1.0",
+    "numpy>=1.26",
+    "pyproj>=3.6",
+    "pystac-client>=0.7",
+    "planetary-computer>=1.0",
+    "rasterio>=1.3",
+    "shapely>=2.0",
+]
+
+[project.scripts]
+geovault = "geovault.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

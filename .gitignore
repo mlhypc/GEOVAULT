@@ -1,0 +1,15 @@
+# local data vault (never committed)
+data/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+
+# editors
+.vscode/
+.idea/
