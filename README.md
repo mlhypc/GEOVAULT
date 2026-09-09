@@ -171,6 +171,14 @@ same day cover the same tile (adjacent MGRS granules overlap at their edges),
 the tile with more valid pixels is kept, ties going to the lexically smaller
 scene id.
 
+Every ingest logs the same lines to the console and to a run log,
+`data/logs/<dataset>_<YYYYmmdd-HHMMSS>.log`, each stamped with the time. Scene
+lines carry elapsed time, scenes per minute and the remaining-time estimate,
+computed from completed scenes (so concurrent workers finishing out of order do
+not skew it). Plain lines rather than a progress bar on purpose: long runs go to
+the background with output redirected, and a carriage-return bar is noise in a
+file. Logs are run artifacts, they live under `data/` and are not committed.
+
 Note on clouds: `--cloud-max` filters on the scene-level (whole MGRS square or
 WRS scene) average. Keep it loose (around 80) and select per tile at read time
 using the stored `cloud_pct`, which is computed locally per tile from SCL pixels

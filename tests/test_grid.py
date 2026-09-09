@@ -107,3 +107,15 @@ def test_encode_geotiff_scale_offset_roundtrip():
         assert ds.scales == (2.75e-05,) and ds.offsets == (-0.2,)
         assert (ds.read(1) == arr).all()
         assert ds.transform.c == 15.0 + 3 * 480 and ds.nodata == 0
+
+
+def test_progress_and_duration_format():
+    from geovault.log import Progress, fmt_duration
+    assert fmt_duration(30) == "30s" and fmt_duration(90) == "1m30s" and fmt_duration(4000) == "1h06m"
+    p = Progress(4)
+    s = p.tick()
+    assert s.startswith("elapsed ") and "/min" in s and "eta" in s
+    for _ in range(3):
+        s = p.tick()
+    assert p.done == 4 and s.endswith("eta 0s")
+    assert p.summary().startswith("4/4 in ")

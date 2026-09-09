@@ -78,18 +78,20 @@ def main(argv=None):
         return 0
 
     # ingest
+    from .log import setup as _setup_log, Progress
+    log = _setup_log(a.dataset)
     aoi = None
     if a.geojson:
         from .aoi import load_geojson
         aoi = load_geojson(a.geojson)
         a.bbox = list(aoi.bounds)
-        print(f"AOI: {a.geojson} (bbox={tuple(round(v, 4) for v in aoi.bounds)})")
+        log.info(f"AOI: {a.geojson} (bbox={tuple(round(v, 4) for v in aoi.bounds)})")
     elif a.point:
         from .aoi import point_buffer
         lat, lon = a.point
         aoi = point_buffer(lon, lat, a.buffer)
         a.bbox = list(aoi.bounds)
-        print(f"AOI: point {lat}, {lon} with {a.buffer} m buffer")
+        log.info(f"AOI: point {lat}, {lon} with {a.buffer} m buffer")
     if not a.bbox:
         ap.error("ingest needs --bbox, --geojson or --point")
 
@@ -106,28 +108,28 @@ def main(argv=None):
         skip = set()
         for res in src.RES_LIST:
             skip |= writer.existing_keys(res, [""])
-        print(f"[{a.dataset}] static ingest, bbox={bbox}")
-        print(f"  {len(skip)} tiles already cached (will be skipped)")
+        log.info(f"[{a.dataset}] static ingest, bbox={bbox}")
+        log.info(f"  {len(skip)} tiles already cached (will be skipped)")
         import inspect
         extra = {"workers": a.workers} if "workers" in inspect.signature(src.ingest).parameters else {}
         total = src.ingest(bbox, writer, bands=a.bands, skip_keys=skip,
-                           aoi=aoi, log=lambda m: print(m, flush=True), **extra)
+                           aoi=aoi, log=log.info, **extra)
         for f, n in writer.close().items():
-            print(f"  wrote: {f} (+{n} rows)")
+            log.info(f"  wrote: {f} (+{n} rows)")
         sealed = compact(a.dataset)     # no open parts after a finished run (see the dated path)
         if sealed:
-            print(f"  sealed {len(sealed)} (res, month) groups")
+            log.info(f"  sealed {len(sealed)} (res, month) groups")
         ncat = catalog.rebuild(a.dataset)
-        print(f"  catalog updated: {ncat} rows")
-        print(f"done: {total} new tiles in {time.time() - t0:.0f}s")
+        log.info(f"  catalog updated: {ncat} rows")
+        log.info(f"done: {total} new tiles in {time.time() - t0:.0f}s")
         return 0
 
     if not (a.start and a.end):
         ap.error(f"{a.dataset} is time-varying: --start and --end are required")
 
-    print(f"[{a.dataset}] STAC search: {a.start}..{a.end} bbox={bbox}")
+    log.info(f"[{a.dataset}] STAC search: {a.start}..{a.end} bbox={bbox}")
     items = src.search(bbox, a.start, a.end, cloud_max=a.cloud_max, limit=a.max_scenes)
-    print(f"  {len(items)} scenes found")
+    log.info(f"  {len(items)} scenes found")
     if not items:
         return 0
 
@@ -139,7 +141,7 @@ def main(argv=None):
     skip = set()
     for res in res_list:
         skip |= writer.existing_keys(res, months)
-    print(f"  {len(skip)} tiles already cached (will be skipped)")
+    log.info(f"  {len(skip)} tiles already cached (will be skipped)")
 
     if a.dry_run:
         # Coverage check against the catalog: what would still be fetched.
@@ -156,8 +158,8 @@ def main(argv=None):
             missing += n
             if n:
                 detail = ", ".join(f"{b}:{k}" for b, k in sorted(plan.items()))
-                print(f"  [{i}/{len(items)}] {item.id}  {n} tiles not in store ({detail})")
-        print(f"dry-run: {missing} tiles would be fetched across {len(items)} scenes")
+                log.info(f"  [{i}/{len(items)}] {item.id}  {n} tiles not in store ({detail})")
+        log.info(f"dry-run: {missing} tiles would be fetched across {len(items)} scenes")
         return 0 if missing == 0 else 1
 
     total = 0
@@ -167,6 +169,8 @@ def main(argv=None):
     SCENE_WORKERS = a.workers # scenes fetched concurrently (each scene fans out over its bands)
     from concurrent.futures import ThreadPoolExecutor
 
+    prog = Progress(len(items))   # elapsed / rate / ETA on every scene line, from completed scenes
+
     def one(idx_item):
         i, item = idx_item
         try:
@@ -174,9 +178,9 @@ def main(argv=None):
                                  log=lambda m: None, keep_offzone=a.keep_offzone, aoi=aoi)
         except Exception as e:      # one bad scene must not sink the chunk
             failed.append((item.id, f"{type(e).__name__}: {e}"))
-            print(f"  [{i}/{len(items)}] {item.id}  FAILED {type(e).__name__}: {e}", flush=True)
+            log.info(f"  [{i}/{len(items)}] {item.id}  FAILED {type(e).__name__}: {e}  · {prog.tick()}")
             return 0
-        print(f"  [{i}/{len(items)}] {item.id}  {n} tiles", flush=True)
+        log.info(f"  [{i}/{len(items)}] {item.id}  {n} tiles  · {prog.tick()}")
         return n
 
     with ThreadPoolExecutor(max_workers=SCENE_WORKERS) as ex:
@@ -187,25 +191,25 @@ def main(argv=None):
             for f, n in part.items():
                 written[f] = written.get(f, 0) + n
             if part:
-                print(f"  flushed {sum(part.values())} rows to disk", flush=True)
+                log.info(f"  flushed {sum(part.values())} rows to disk")
 
     for f, n in writer.close().items():
         written[f] = written.get(f, 0) + n
     for f, n in written.items():
-        print(f"  wrote: {f} (+{n} rows)")
+        log.info(f"  wrote: {f} (+{n} rows)")
     # Seal: a finished run leaves no open part files behind. Parts are the write-side mechanism
     # (cheap appends, crash-safe chunks); once the run is over each touched month is merged into
     # its single sealed file. Readers never cared (the catalog names the files), humans do.
     sealed = compact(a.dataset)
     if sealed:
-        print(f"  sealed {len(sealed)} (res, month) groups")
+        log.info(f"  sealed {len(sealed)} (res, month) groups")
     ncat = catalog.rebuild(a.dataset)
-    print(f"  catalog updated: {ncat} rows")
+    log.info(f"  catalog updated: {ncat} rows")
     if failed:
-        print(f"  {len(failed)} scenes FAILED (re-run the same command to retry them):")
+        log.info(f"  {len(failed)} scenes FAILED (re-run the same command to retry them):")
         for sid, err in failed:
-            print(f"    {sid}  {err}")
-    print(f"done: {total} new tiles in {time.time() - t0:.0f}s"
+            log.info(f"    {sid}  {err}")
+    log.info(f"done: {total} new tiles, {prog.summary()}"
           + (f", {len(failed)} scenes failed" if failed else ""))
     return 2 if failed else 0
 
