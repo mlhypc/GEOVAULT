@@ -36,8 +36,13 @@ def main(argv=None):
                    help="scene-level cloud filter; keep it loose (80), select per tile at read time")
     p.add_argument("--bands", nargs="+")
     p.add_argument("--max-scenes", type=int)
+    p.add_argument("--workers", type=int, default=3,
+                   help="scenes fetched concurrently (each scene already reads its bands in parallel); default 3")
     p.add_argument("--keep-offzone", action="store_true",
                    help="allow duplicate storage across UTM zone boundaries")
+    p.add_argument("--dry-run", action="store_true",
+                   help="fetch nothing; report per scene how many tiles are not in the store yet "
+                        "(exit 0 = complete, 1 = gaps). Use it to verify coverage after an ingest.")
 
     p = sub.add_parser("coverage", help="what is stored (dates, bands, tile counts)")
     p.add_argument("dataset")
@@ -93,16 +98,25 @@ def main(argv=None):
     t0 = time.time()
 
     if getattr(src, "STATIC", False):
+        if a.dry_run:
+            # Static sources have no scene plan to check against; until they do, refuse rather than
+            # silently run the real ingest (a 294-tile Turkey fetch once happened under --dry-run).
+            ap.error(f"{a.dataset} is static and does not support --dry-run")
         writer = Writer(a.dataset)
         skip = set()
         for res in src.RES_LIST:
             skip |= writer.existing_keys(res, [""])
         print(f"[{a.dataset}] static ingest, bbox={bbox}")
         print(f"  {len(skip)} tiles already cached (will be skipped)")
+        import inspect
+        extra = {"workers": a.workers} if "workers" in inspect.signature(src.ingest).parameters else {}
         total = src.ingest(bbox, writer, bands=a.bands, skip_keys=skip,
-                           aoi=aoi, log=lambda m: print(m))
+                           aoi=aoi, log=lambda m: print(m, flush=True), **extra)
         for f, n in writer.close().items():
             print(f"  wrote: {f} (+{n} rows)")
+        sealed = compact(a.dataset)     # no open parts after a finished run (see the dated path)
+        if sealed:
+            print(f"  sealed {len(sealed)} (res, month) groups")
         ncat = catalog.rebuild(a.dataset)
         print(f"  catalog updated: {ncat} rows")
         print(f"done: {total} new tiles in {time.time() - t0:.0f}s")
@@ -127,20 +141,73 @@ def main(argv=None):
         skip |= writer.existing_keys(res, months)
     print(f"  {len(skip)} tiles already cached (will be skipped)")
 
-    total = 0
-    for i, item in enumerate(items, 1):
-        print(f"  [{i}/{len(items)}] {item.id}")
-        total += src.ingest_scene(item, bbox, writer, bands=a.bands,
-                                  skip_keys=skip, log=lambda m: print(m),
+    if a.dry_run:
+        # Coverage check against the catalog: what would still be fetched.
+        # Exit 0 when nothing is missing, 1 otherwise. Edge tiles outside a
+        # scene's footprint are never stored, so a small residue on granule
+        # edges is normal; a whole scene reporting all its tiles is a gap.
+        if not hasattr(src, "plan_scene"):
+            ap.error(f"{a.dataset} does not support --dry-run")
+        missing = 0
+        for i, item in enumerate(items, 1):
+            plan = src.plan_scene(item, bbox, bands=a.bands, skip_keys=skip,
                                   keep_offzone=a.keep_offzone, aoi=aoi)
+            n = sum(plan.values())
+            missing += n
+            if n:
+                detail = ", ".join(f"{b}:{k}" for b, k in sorted(plan.items()))
+                print(f"  [{i}/{len(items)}] {item.id}  {n} tiles not in store ({detail})")
+        print(f"dry-run: {missing} tiles would be fetched across {len(items)} scenes")
+        return 0 if missing == 0 else 1
 
-    written = writer.close()
+    total = 0
+    written = {}
+    failed = []               # (scene_id, error) for scenes whose ingest raised
+    FLUSH_EVERY = 25          # scenes per chunk; an interrupted run keeps every finished chunk
+    SCENE_WORKERS = a.workers # scenes fetched concurrently (each scene fans out over its bands)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(idx_item):
+        i, item = idx_item
+        try:
+            n = src.ingest_scene(item, bbox, writer, bands=a.bands, skip_keys=skip,
+                                 log=lambda m: None, keep_offzone=a.keep_offzone, aoi=aoi)
+        except Exception as e:      # one bad scene must not sink the chunk
+            failed.append((item.id, f"{type(e).__name__}: {e}"))
+            print(f"  [{i}/{len(items)}] {item.id}  FAILED {type(e).__name__}: {e}", flush=True)
+            return 0
+        print(f"  [{i}/{len(items)}] {item.id}  {n} tiles", flush=True)
+        return n
+
+    with ThreadPoolExecutor(max_workers=SCENE_WORKERS) as ex:
+        for start in range(0, len(items), FLUSH_EVERY):
+            chunk = list(enumerate(items[start:start + FLUSH_EVERY], start + 1))
+            total += sum(ex.map(one, chunk))
+            part = writer.close()          # rows -> new part files (auto-compacted past the threshold)
+            for f, n in part.items():
+                written[f] = written.get(f, 0) + n
+            if part:
+                print(f"  flushed {sum(part.values())} rows to disk", flush=True)
+
+    for f, n in writer.close().items():
+        written[f] = written.get(f, 0) + n
     for f, n in written.items():
         print(f"  wrote: {f} (+{n} rows)")
+    # Seal: a finished run leaves no open part files behind. Parts are the write-side mechanism
+    # (cheap appends, crash-safe chunks); once the run is over each touched month is merged into
+    # its single sealed file. Readers never cared (the catalog names the files), humans do.
+    sealed = compact(a.dataset)
+    if sealed:
+        print(f"  sealed {len(sealed)} (res, month) groups")
     ncat = catalog.rebuild(a.dataset)
     print(f"  catalog updated: {ncat} rows")
-    print(f"done: {total} new tiles in {time.time() - t0:.0f}s")
-    return 0
+    if failed:
+        print(f"  {len(failed)} scenes FAILED (re-run the same command to retry them):")
+        for sid, err in failed:
+            print(f"    {sid}  {err}")
+    print(f"done: {total} new tiles in {time.time() - t0:.0f}s"
+          + (f", {len(failed)} scenes failed" if failed else ""))
+    return 2 if failed else 0
 
 
 if __name__ == "__main__":

@@ -36,6 +36,11 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
    at write time. Display products, if ever needed, are derived, never primary.
 5. **Deterministic grid.** The tile lattice is anchored at each CRS origin, so
    the same ground always maps to the same (x, y), across runs and datasets.
+   Static COG sources keep only their sub-pixel registration offset and use a
+   tile size that divides their file size (240 px), so neighbouring files share
+   one lattice and no tile straddles two files. Landsat is the one dated source
+   with a fixed non-zero anchor (15 m, see [Landsat](#landsat)); the anchor is a
+   property of the dataset, never of the run or the scene.
 
 ## Data sources
 
@@ -43,9 +48,41 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 |---------|---------|--------|------|
 | `s2` | Sentinel-2 L2A, 13 bands, 10/20/60 m | AWS earth-search (element84) STAC + COG | none |
 | `s1` | Sentinel-1 RTC (terrain-corrected gamma0), VV/VH, 10 m | Microsoft Planetary Computer | none |
+| `landsat` | Landsat Collection 2 Level-2 (L4-5 TM, 7 ETM+, 8-9 OLI/TIRS), surface reflectance + surface temperature, 30 m, 1982 to today | Microsoft Planetary Computer | none |
 | `glo30` | Copernicus GLO-30 DEM, 30 m, static | AWS open data COG | none |
 | `worldcover` | ESA WorldCover 2021, 10 m land cover, static | AWS open data COG | none |
 | `soilgrids` | SoilGrids 250 m soil properties (11 props x 6 depths), static | ISRIC VRT/COG | none |
+
+### Landsat
+
+Landsat sits next to Sentinel-2 for two things S2 cannot give: a thermal band
+(surface temperature) and an archive back to the 1980s. It is not an S2
+replacement (30 m, 16-day cycle per satellite, 8 days with L8+L9 together).
+
+```bash
+geovault ingest --dataset landsat --geojson parcel.geojson --start 2013-01-01 --end 2026-09-01 --cloud-max 80
+```
+
+Bands are the STAC common names, so one adapter reads every generation:
+`coastal` (L8/9 only), `blue`, `green`, `red`, `nir08`, `swir16`, `swir22`
+(surface reflectance), `lwir` (surface temperature; asset `lwir11` on L8/9,
+`lwir` on L4-7) and `qa_pixel` (CFMask bits). Only Tier 1 scenes are taken.
+Pixels are stored raw (uint16, lossless); the physical value is
+`reflectance = DN * 2.75e-5 - 0.2` and `kelvin = DN * 0.00341802 + 149`, and
+both factors are written into every blob as GeoTIFF band scale/offset
+(`ds.scales[0]`, `ds.offsets[0]` in rasterio). `cloud_pct` per tile comes from
+`qa_pixel` bits 1-4 (dilated cloud, cirrus, cloud, shadow), computed locally
+like SCL for S2. Landsat 7 SLC-off stripes (2003 onwards) arrive as nodata and
+count against the tile's valid pixels.
+
+Grid note: Landsat Collection 2 pixel edges sit 15 m off the UTM origin (scene
+origins end in ...85/...15), the same for every scene and generation, so the
+`landsat` lattice is anchored at (15, 15) and its tiles are 7.68 km (256 px).
+A per-scene anchor would have broken the dedup key across scenes.
+
+Latency: Planetary Computer publishes a Landsat scene about a week after
+acquisition (measured: acquired 2026-08-24, catalogued 2026-08-31). Sentinel-2
+on earth-search is same-day (median 5 h), Sentinel-1 RTC under a day.
 
 Static datasets need no date range:
 
@@ -56,8 +93,26 @@ geovault ingest --dataset soilgrids --geojson parcel.geojson            # topsoi
 geovault ingest --dataset soilgrids --geojson parcel.geojson --bands clay_0-5cm clay_5-15cm
 ```
 
+Copernicus GLO-30 is not published for every country: the public bucket has no
+cells over e.g. Azerbaijan and Armenia (HTTP 404), so parcels there get no DEM
+tiles and the ingest reports them as missing assets, not as an error.
+
 SoilGrids is stored in its native Goode Homolosine projection (no resampling);
-the reader's clip reprojects the polygon, not the pixels.
+the reader's clip reprojects the polygon, not the pixels. Its bands are
+independent VRTs, so `--workers N` fetches N bands at a time (each ISRIC VRT
+costs several seconds just to open; 6 workers measured ~3x faster than
+sequential). With a `--geojson` AOI, static ingests take their candidate tiles
+from the bbox of each polygon part, not from the AOI's overall bbox: parcels
+spread over several countries would otherwise expand to a continent-sized
+rectangle (37k tiles per band tested and rejected, versus 135 real ones).
+
+SoilGrids is fetched band by band and the Python threads of `--workers` share one
+GIL with GDAL: 6 threads measured 1.2 cores. For a large AOI run several
+`geovault ingest` processes with disjoint `--bands` instead (Turkey, 61 bands:
+6 processes finished in 40 min where one 6-thread process was heading for 5.5 h).
+Processes write their own part files; compaction takes a per-month lock file so
+concurrent closes do not merge the same parts twice. `ocs` exists only as
+`ocs_0-30cm` on ISRIC; other `ocs_<depth>` bands yield 0 tiles.
 
 Static layers have an empty date and one band each, except SoilGrids where the
 band is the property and depth:
@@ -88,17 +143,55 @@ geovault ingest --dataset s2 --geojson parcel.geojson --start 2024-06-01 --end 2
 geovault ingest --dataset s2 --bbox 35.30 36.71 35.33 36.73 \
     --start 2024-06-01 --end 2024-06-30 --cloud-max 80 --bands B4 B8 SCL --max-scenes 2
 
+geovault ingest ... --dry-run            # same arguments: report what is still missing, fetch nothing
 geovault coverage s2 --date 2024-06     # what is stored
-geovault compact s2                     # seal open month part files
+geovault compact s2                     # seal open month part files (a finished ingest does this itself)
 geovault rebuild-catalog s2             # regenerate the catalog from the store
 ```
 
 Re-running an ingest is safe and cheap: cached tiles are skipped via the catalog,
 so the same command serves both the initial backfill and incremental top-ups.
+Long scene ingests write to disk every 25 scenes, so an interrupted run keeps
+what it fetched and the next run resumes from there.
 
-Note on clouds: `--cloud-max` filters on the scene-level (whole MGRS square)
-average. Keep it loose (around 80) and select per tile at read time using the
-stored `cloud_pct`, which is computed locally per tile from SCL pixels.
+Failures are per scene, not per run: a scene whose fetch raises is reported as
+`FAILED`, the other scenes of its chunk are still written, the failed ids are
+listed at the end and the exit code is 2. Re-running the same command retries
+exactly those scenes. A native crash inside GDAL cannot be caught this way (the
+process dies with no traceback), which is why coverage should be verified from
+the catalog, not from the exit code: `--dry-run` with the ingest's own arguments
+prints, per scene, how many tiles are not in the store yet and exits 0 only when
+nothing is missing. Tiles outside a scene's footprint are never stored, so a
+small residue on granule edges is normal; a scene reporting all of its tiles is
+a gap. Scenes are fetched
+concurrently (`--workers`, default 3; each scene already reads its bands in
+parallel), about 2.7x faster than one at a time against the AWS open-data
+buckets. The result does not depend on fetch order: when two scenes of the
+same day cover the same tile (adjacent MGRS granules overlap at their edges),
+the tile with more valid pixels is kept, ties going to the lexically smaller
+scene id.
+
+Note on clouds: `--cloud-max` filters on the scene-level (whole MGRS square or
+WRS scene) average. Keep it loose (around 80) and select per tile at read time
+using the stored `cloud_pct`, which is computed locally per tile from SCL pixels
+(S2) or `qa_pixel` bits (Landsat). S1 has no cloud value.
+
+Note on AOI selection: a tile is taken when its WGS84 envelope intersects the
+AOI polygon. UTM tiles are slightly rotated in lat/lon, so the envelopes of
+neighbouring tiles overlap a little across the shared edge, and a polygon that
+ends exactly on a tile edge still pulls the neighbour in. Expect a few extra
+tiles along AOI borders; the tile is the unit, not the polygon.
+
+## Consumers
+
+AGRO_DATA_LOCAL (TOPRAQ_AGRODB) reads this vault directly: the parcel analysis
+layer (`/api/ee/*`: GLO-30 elevation, Sentinel-2 indices and composites,
+Sentinel-1 backscatter products, Landsat surface temperature and indices,
+clipped per parcel on demand) and the dated "S2" base layer
+(`/api/basetile/s2-<date>/…`, B4/B3/B2 true colour warped to Web Mercator) both
+go through the catalog and read blobs only from the files it names. Nothing is
+copied out of the vault. Landsat pixels are stored raw; the consumer applies the
+scale/offset carried in each blob (see [Landsat](#landsat)).
 
 ## Reading from other projects
 
@@ -150,11 +243,13 @@ never invalidates data.
 
 ### Write pattern (hot month)
 
-Ingest is a cheap append: each run writes a new `r<res>.part-<id>.parquet` and
+Ingest is a cheap append: each flush writes a new `r<res>.part-<id>.parquet` and
 touches nothing else. Once a month spans more than 3 files it is auto-compacted
-into a single sealed file at close; `geovault compact <dataset>` does the same
-on demand and doubles as crash repair. Readers go through the catalog's `file`
-column, so parts are completely transparent.
+into a single sealed file at close, and **every finished run seals all the months
+it touched**, so part files exist only while a run is in progress (or after a
+crash). `geovault compact <dataset>` does the same on demand and doubles as crash
+repair. Readers go through the catalog's `file` column, so parts are transparent
+to them either way.
 
 ### UTM zone boundary rule
 
@@ -184,6 +279,7 @@ each provider's terms and license before fetching or publishing anything:
 | Data | License / terms to check |
 |------|--------------------------|
 | Sentinel-1 / Sentinel-2 | Copernicus Sentinel data legal notice (free use with attribution: "Contains modified Copernicus Sentinel data") |
+| Landsat Collection 2 | USGS, public domain; attribution requested: "Landsat imagery courtesy of the U.S. Geological Survey" |
 | Copernicus GLO-30 DEM | Copernicus DEM license (ESA / Airbus terms) |
 | ESA WorldCover | CC BY 4.0, attribution required |
 | SoilGrids (ISRIC) | CC BY 4.0, attribution required |

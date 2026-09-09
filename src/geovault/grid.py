@@ -10,8 +10,15 @@ way in a previous system.)
 
 Some static sources are not aligned to their CRS origin (Copernicus DEM is
 pixel-center registered, so its edges sit half a pixel off the degree lines).
-For those the anchor (ox, oy) is derived from the source's own transform,
-modulo the tile size, which is still deterministic per source.
+For those the anchor (ox, oy) is the file origin modulo the tile size (nearest
+corner), which is the same value for every file of the product once the tile
+size divides the file spacing, so the tile lattice is still global: two COG files of the same
+product (neighbouring 1-degree cells) yield the same (x, y) for the same ground.
+Anchoring at each file's own corner modulo the tile size, as an earlier version
+did, made neighbouring files disagree whenever the file size in pixels is not a
+multiple of the tile size (3600 px per degree vs 256), which collided keys and
+silently dropped tiles. Static sources pick a tile_px that divides their file
+size (240) so no tile straddles two files.
 
 Tile index (x, y): x counts east from 0, y counts north from 0.
 """
@@ -34,10 +41,28 @@ class Grid:
 
     @classmethod
     def from_transform(cls, crs, transform, tile_px):
-        """Grid aligned to a source raster's own pixel lattice."""
+        """Grid on the source raster's pixel lattice, anchored globally: only the
+        sub-pixel shift of the raster origin relative to the CRS origin is kept
+        (e.g. the half-pixel of a pixel-centre-registered DEM), so every file of
+        the product shares one lattice and one (x, y) numbering."""
         res = transform.a
         ts = res * tile_px
-        return cls(str(crs), res, tile_px, transform.c % ts, transform.f % ts)
+        # the file origin must itself be a tile corner: anchor = origin modulo the tile
+        # size, nearest corner. Identical for every file of a product as long as the
+        # file spacing is a multiple of the tile size (checked by aligned_with_raster).
+        ox = transform.c - ts * math.floor(transform.c / ts + 0.5)
+        oy = transform.f - ts * math.floor(transform.f / ts + 0.5)
+        return cls(str(crs), res, tile_px, ox, oy)
+
+    def aligned_with_raster(self, transform, width: int, height: int) -> bool:
+        """True when the raster edges fall on tile edges of this grid, i.e. no
+        tile straddles this raster and its neighbour (needs width % tile_px == 0
+        and the raster origin on a tile corner)."""
+        if width % self.tile_px or height % self.tile_px:
+            return False
+        kx = (transform.c - self.ox) / self.tile_size
+        ky = (transform.f - self.oy) / self.tile_size
+        return abs(kx - round(kx)) < 1e-6 and abs(ky - round(ky)) < 1e-6
 
     def tile_of_point(self, cx: float, cy: float) -> tuple:
         """Tile index containing a native-CRS point."""

@@ -32,8 +32,12 @@ NODATA = 0
 TILE_PX = 256
 WORKERS = 6   # wave-2 band parallelism; each band opens its own COG handle
 
+import os
 _ENV = dict(AWS_NO_SIGN_REQUEST="YES", GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
             GDAL_HTTP_MULTIPLEX="YES", VSI_CACHE="TRUE")
+for _k, _v in _ENV.items():
+    os.environ.setdefault(_k, _v)   # visible to every thread (rasterio.Env is thread-local)
+
 
 
 def search(bbox, start, end, cloud_max=None, limit=None):
@@ -72,13 +76,8 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
 
     def band_todo(band, res):
         grid = Grid(crs, res, TILE_PX)
-        nw, ns, ne, nn = common.bbox_to_crs(bbox, crs)
-        return grid, [
-            (tx, ty) for tx, ty in grid.tiles_for_bounds(nw, ns, ne, nn)
-            if (band, date, tx, ty) not in skip_keys
-            and (keep_offzone or common.tile_is_canonical(grid, tx, ty, crs))
-            and in_aoi(common.wgs84_bounds(grid, tx, ty, crs))
-        ]
+        return grid, common.plan_tiles(grid, bbox, crs, band, date, skip_keys,
+                                       keep_offzone, in_aoi)
 
     def fetch_band(band):
         """One band -> list of prepared rows (thread-safe: no writer access)."""
@@ -102,7 +101,8 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
                 rows.append((band, date, tx, ty, crs, res, TILE_PX,
                              common.wgs84_bounds(grid, tx, ty, crs), NODATA,
                              cloud, scene,
-                             common.encode_geotiff(arr, grid, tx, ty, crs, NODATA)))
+                             common.encode_geotiff(arr, grid, tx, ty, crs, NODATA),
+                             int((arr != NODATA).sum())))   # valid_px: the fuller granule wins a same-day key
         return rows
 
     written = 0
@@ -111,10 +111,14 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
         if "SCL" in bands:
             for row in fetch_band("SCL"):
                 written += 1 if writer.add(*row) else 0
-        # If SCL was already cached (skipped), load it from the store so the
-        # second wave still gets real cloud_pct values instead of NULLs.
+        # If any SCL tile of this date was already cached (skipped), load the
+        # stored SCL so the second wave still gets real cloud_pct values instead
+        # of NULLs. Checking `not scl` alone is wrong: a partially overlapping
+        # AOI fetches some SCL tiles and skips others, and the 10 m tiles under
+        # the skipped ones would get None.
         rest = [b for b in bands if b != "SCL"]
-        if rest and not scl:
+        scl_skipped = any(k[0] == "SCL" and k[1] == date for k in skip_keys)
+        if rest and (not scl or scl_skipped):
             _load_scl_from_store(writer.dataset, date, crs, scl_grid, scl)
         # Wave 2: remaining bands in parallel.
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -123,6 +127,27 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
                     written += 1 if writer.add(*row) else 0
     log(f"    {written} tiles")
     return written
+
+
+def plan_scene(item, bbox, bands=None, skip_keys=None, keep_offzone=False, aoi=None) -> dict:
+    """band -> number of tiles this scene would still fetch (nothing is read).
+    Edge tiles outside the scene footprint are counted too: they can never be
+    stored, so a small residue on granule edges is normal after a full ingest."""
+    from ..aoi import tile_filter
+    bands = bands or DEFAULT_BANDS
+    skip_keys = skip_keys or set()
+    date, crs = common.scene_date_crs(item)
+    in_aoi = tile_filter(aoi)
+    out = {}
+    for band in bands:
+        asset_key, res = BAND_TO_ASSET[band]
+        if asset_key not in item.assets:
+            continue
+        n = len(common.plan_tiles(Grid(crs, res, TILE_PX), bbox, crs, band, date,
+                                  skip_keys, keep_offzone, in_aoi))
+        if n:
+            out[band] = n
+    return out
 
 
 def _load_scl_from_store(dataset, date, crs, scl_grid, scl):
@@ -141,6 +166,8 @@ def _load_scl_from_store(dataset, date, crs, scl_grid, scl):
         f"WHERE band='SCL' AND date=? AND crs=?", [date, crs]).fetchall()
     con.close()
     for x, y, blob in rows:
+        if (x, y) in scl:
+            continue    # freshly fetched this run wins over the stored copy
         with rio.MemoryFile(io.BytesIO(bytes(blob))) as mem:
             with mem.open() as ds:
                 scl[(x, y)] = ds.read(1)

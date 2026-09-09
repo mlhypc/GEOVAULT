@@ -13,8 +13,12 @@ from ..aoi import tile_filter
 from ..grid import Grid
 from . import common
 
+import os
 _ENV = dict(AWS_NO_SIGN_REQUEST="YES", GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
             GDAL_HTTP_MULTIPLEX="YES", VSI_CACHE="TRUE")
+for _k, _v in _ENV.items():
+    os.environ.setdefault(_k, _v)   # visible to every thread (rasterio.Env is thread-local)
+
 
 
 def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
@@ -33,6 +37,12 @@ def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
             with ds:
                 crs = str(ds.crs) if ds.crs.to_epsg() is None else f"EPSG:{ds.crs.to_epsg()}"
                 grid = Grid.from_transform(crs, ds.transform, tile_px)
+                if len(hrefs) > 1 and not grid.aligned_with_raster(ds.transform, ds.width, ds.height):
+                    # a tile would straddle this file and its neighbour: both files would write the
+                    # same key with half the pixels each. Refuse rather than store half-empty tiles.
+                    raise ValueError(
+                        f"{href.rsplit('/', 1)[-1]}: {ds.width}x{ds.height} px is not tiled by "
+                        f"tile_px={tile_px}; pick a tile_px that divides the file size")
                 nd = nodata if nodata is not None else (ds.nodata if ds.nodata is not None else 0)
                 nw, ns, ne, nn = common.bbox_to_crs(bbox, crs)
                 rb = ds.bounds
@@ -40,7 +50,11 @@ def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
                 e = min(ne, rb.right); n = min(nn, rb.top)
                 if w >= e or s >= n:
                     continue
-                for tx, ty in grid.tiles_for_bounds(w, s, e, n):
+                # candidates per AOI part (see common.candidate_tiles), clipped to this raster's extent
+                for tx, ty in common.candidate_tiles(grid, bbox, crs, aoi):
+                    tw, ts, te, tn = grid.tile_bounds(tx, ty)
+                    if te <= w or tw >= e or tn <= s or ts >= n:
+                        continue
                     if (band, "", tx, ty) in skip_keys:
                         continue
                     wb = common.wgs84_bounds(grid, tx, ty, crs)

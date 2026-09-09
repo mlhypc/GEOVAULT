@@ -28,7 +28,19 @@ def tile_filter(aoi):
     aoi None means everything passes (plain bbox mode)."""
     if aoi is None:
         return lambda b: True
-    return lambda b: aoi.intersects(box(b[0], b[1], b[2], b[3]))
+    import math
+    from shapely.prepared import prep
+    hit = prep(aoi).intersects          # prepared: thousands of parcels, thousands of tile tests
+
+    def f(b):
+        # A tile of an interrupted projection (SoilGrids' Goode Homolosine) can fall outside the
+        # projection's domain when the AOI bbox is very wide (parcels on several continents): its
+        # corners come back as NaN/Inf from the transform, and GEOS raises on a NaN box. No ground
+        # there anyway, so such a tile never intersects.
+        if not all(math.isfinite(v) for v in b):
+            return False
+        return hit(box(b[0], b[1], b[2], b[3]))
+    return f
 
 
 def to_crs(geom, crs):

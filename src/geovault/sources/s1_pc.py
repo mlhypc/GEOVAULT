@@ -27,8 +27,12 @@ NODATA = -32768.0
 RES = 10
 TILE_PX = 256
 
+import os
 _ENV = dict(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", GDAL_HTTP_MULTIPLEX="YES",
             VSI_CACHE="TRUE")
+for _k, _v in _ENV.items():
+    os.environ.setdefault(_k, _v)   # visible to every thread (rasterio.Env is thread-local)
+
 
 
 def search(bbox, start, end, limit=None, **_):
@@ -38,6 +42,26 @@ def search(bbox, start, end, limit=None, **_):
     ).items())
     items.sort(key=lambda i: i.properties["datetime"])
     return items[:limit] if limit else items
+
+
+def plan_scene(item, bbox, bands=None, skip_keys=None, keep_offzone=False, aoi=None) -> dict:
+    """band -> number of tiles this scene would still fetch (nothing is read).
+    Edge tiles outside the scene footprint are counted too, so a small residue
+    on scene edges is normal after a full ingest."""
+    from ..aoi import tile_filter
+    bands = bands or DEFAULT_BANDS
+    skip_keys = skip_keys or set()
+    date, crs = common.scene_date_crs(item)
+    grid = Grid(crs, RES, TILE_PX)
+    in_aoi = tile_filter(aoi)
+    out = {}
+    for band in bands:
+        if BANDS[band] not in item.assets:
+            continue
+        n = len(common.plan_tiles(grid, bbox, crs, band, date, skip_keys, keep_offzone, in_aoi))
+        if n:
+            out[band] = n
+    return out
 
 
 def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
@@ -59,11 +83,8 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
             key = BANDS[band]
             if key not in item.assets:
                 continue
-            nw, ns, ne, nn = common.bbox_to_crs(bbox, crs)
-            todo = [(tx, ty) for tx, ty in grid.tiles_for_bounds(nw, ns, ne, nn)
-                    if (band, date, tx, ty) not in skip_keys
-                    and (keep_offzone or common.tile_is_canonical(grid, tx, ty, crs))
-                    and in_aoi(common.wgs84_bounds(grid, tx, ty, crs))]
+            todo = common.plan_tiles(grid, bbox, crs, band, date, skip_keys,
+                                     keep_offzone, in_aoi)
             if not todo:
                 continue
             with rasterio.open(item.assets[key].href) as ds:
