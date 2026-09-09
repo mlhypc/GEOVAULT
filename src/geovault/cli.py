@@ -178,9 +178,9 @@ def main(argv=None):
                                  log=lambda m: None, keep_offzone=a.keep_offzone, aoi=aoi)
         except Exception as e:      # one bad scene must not sink the chunk
             failed.append((item.id, f"{type(e).__name__}: {e}"))
-            log.info(f"  [{i}/{len(items)}] {item.id}  FAILED {type(e).__name__}: {e}  · {prog.tick()}")
+            log.info(f"  [{i}/{len(items)}] {item.id}  FAILED {type(e).__name__}: {e}  | {prog.tick()}")
             return 0
-        log.info(f"  [{i}/{len(items)}] {item.id}  {n} tiles  · {prog.tick()}")
+        log.info(f"  [{i}/{len(items)}] {item.id}  {n} tiles  | {prog.tick()}")
         return n
 
     with ThreadPoolExecutor(max_workers=SCENE_WORKERS) as ex:

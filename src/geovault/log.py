@@ -55,7 +55,7 @@ def fmt_duration(seconds: float) -> str:
 
 class Progress:
     """Thread-safe counter over a known total; tick() returns the suffix for a progress line:
-    'elapsed 12m03s · 9.8/min · eta 45m'. Rate and ETA use completed items, not the item index,
+    'elapsed 12m03s | 9.8/min | eta 45m'. Rate and ETA use completed items, not the item index,
     so they stay right when items finish out of order (concurrent scene workers)."""
 
     def __init__(self, total: int):
@@ -72,7 +72,7 @@ class Progress:
         rate = done / elapsed * 60 if elapsed > 0 else 0.0
         left = self.total - done
         eta = fmt_duration(left / (rate / 60)) if rate > 0 and left else ("0s" if not left else "?")
-        return f"elapsed {fmt_duration(elapsed)} · {rate:.1f}/min · eta {eta}"
+        return f"elapsed {fmt_duration(elapsed)} | {rate:.1f}/min | eta {eta}"
 
     def summary(self) -> str:
         return f"{self.done}/{self.total} in {fmt_duration(time.time() - self.t0)}"
