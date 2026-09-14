@@ -1,0 +1,5 @@
+# line endings: LF in the repo and in every checkout, whatever the OS
+* text=auto eol=lf
+*.parquet binary
+*.tif binary
+*.png binary
