@@ -13,3 +13,8 @@ dist/
 # editors
 .vscode/
 .idea/
+
+# credentials for non-anonymous sources: only the *.example templates are committed
+api/*
+!api/README.md
+!api/*.example

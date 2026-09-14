@@ -1,0 +1,11 @@
+# Copernicus Climate Data Store (CDS) credentials, used by the `era5land` and `agera5` adapters.
+# 1. Register (free): https://cds.climate.copernicus.eu
+# 2. Copy the Personal Access Token from https://cds.climate.copernicus.eu/profile
+# 3. Accept the "Terms of use" on each dataset page you will pull:
+#      https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land
+#      https://cds.climate.copernicus.eu/datasets/derived-era5-land-daily-statistics
+#      https://cds.climate.copernicus.eu/datasets/sis-agrometeorological-indicators
+# 4. Copy this file to `cdsapirc` (no extension) in this folder and paste the token below.
+#    `api/cdsapirc` is git-ignored; only this .example is committed.
+url: https://cds.climate.copernicus.eu/api
+key: paste-your-personal-access-token-here

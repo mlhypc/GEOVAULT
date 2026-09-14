@@ -52,6 +52,12 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 | `glo30` | Copernicus GLO-30 DEM, 30 m, static | AWS open data COG | none |
 | `worldcover` | ESA WorldCover 2021, 10 m land cover, static | AWS open data COG | none |
 | `soilgrids` | SoilGrids 250 m soil properties (11 props x 6 depths), static | ISRIC VRT/COG | none |
+| `chirps` | CHIRPS 2.0 daily precipitation, 0.05 deg (~5 km), mm/day, 1981 to ~2 days ago | UCSB Climate Hazards Center (gzipped GeoTIFF per day) | none |
+| `modis_lst` | MODIS land surface temperature (MOD11A1 Terra + MYD11A1 Aqua), daily day/night, 1 km, 2000 to today | Microsoft Planetary Computer | none |
+| `era5` | ERA5 reanalysis single levels (2 m temperature, dewpoint, precipitation, wind, radiation, ...), hourly, 0.25 deg, 1940 to ~1 week ago | Google ARCO-ERA5 public bucket (Zarr) | none |
+| `era5land` | ERA5-Land reanalysis, hourly, 0.1 deg, land only, 1950 to ~5 days ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
+| `era5land_daily` | ERA5-Land daily mean/min/max of the instantaneous fields (temperature, dewpoint, wind, soil moisture, skin temperature), local time zone, 0.1 deg | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
+| `agera5` | AgERA5 v2 daily agrometeorological indicators (Tmean/max/min, RH at fixed hours, dewpoint, wind, solar, precipitation), 0.1 deg, 1979 to ~1 week ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
 
 ### Landsat
 
@@ -83,6 +89,137 @@ A per-scene anchor would have broken the dedup key across scenes.
 Latency: Planetary Computer publishes a Landsat scene about a week after
 acquisition (measured: acquired 2026-08-24, catalogued 2026-08-31). Sentinel-2
 on earth-search is same-day (median 5 h), Sentinel-1 RTC under a day.
+
+### Meteorology layers (CHIRPS, MODIS LST)
+
+The vault's rules (no account, no remote compute, native grid, lossless) leave
+few meteorology sources standing: reanalyses (ERA5, AgERA5) live behind CDS
+accounts or Zarr stores, IMERG behind Earthdata login. Two daily products fit
+and are spatially honest at their own resolution:
+
+```bash
+geovault ingest --dataset chirps    --bbox 25.6 35.8 44.9 42.2 --start 2026-01-01 --end 2026-09-14
+geovault ingest --dataset modis_lst --bbox 25.6 35.8 44.9 42.2 --start 2026-01-01 --end 2026-09-14
+```
+
+**`chirps`**: one global file per day, two streams on the UCSB server: `final`
+(station data merged, about three weeks after month end) and `prelim` (~2 days
+behind real time). A day is taken from final when it exists, else prelim, and
+a stored prelim tile is replaced automatically the day final appears
+(`scene_id` is `chirps-final` or `chirps-prelim`; re-run the same ingest to
+upgrade). The files are gzip-compressed plain GeoTIFFs, so they cannot be
+range-read: the whole 2-11 MB file is downloaded and tiled locally, one
+download per day whatever the AOI. Band `precip`, float32 mm/day, nodata -9999
+(also over sea), 100 px tiles of 5 degrees anchored at (0, 0); Turkey is 8
+tiles. `cloud_pct` is None.
+
+**`modis_lst`**: Terra and Aqua are separate bands, not merged: Terra passes
+~10:30/22:30 local, Aqua ~13:30/01:30 (near the daily maximum), and the two
+are different measurements of the same day.
+
+```
+terra_lst_day  terra_lst_night  terra_qc_day  terra_qc_night     (default)
+aqua_lst_day   aqua_lst_night   aqua_qc_day   aqua_qc_night      (default)
+terra_view_time_day ... aqua_view_time_night                     (--bands)
+```
+
+LST is stored raw uint16 with `kelvin = DN * 0.02` written as GeoTIFF scale
+(`ds.scales[0]`), DN 0 = no retrieval. `cloud_pct` of an LST tile is its share
+of DN 0 pixels, computed locally. A tile that is entirely DN 0 (fully cloudy)
+is not stored, exactly like an S2 tile outside its granule; `--dry-run` then
+keeps reporting it and a re-run looks at it again. CRS is the MODIS sinusoidal
+(`+proj=sinu +R=6371007.181`, no EPSG code), 240 px tiles of 222 km anchored
+at (0, 0) (the global origin is an exact multiple of the 1200 px scene, so
+every scene is 5 x 5 whole tiles). Turkey is MODIS tiles h20v04, h20v05,
+h21v04, h21v05: 8 scenes per day. Planetary Computer publishes MODIS about
+2-3 weeks after acquisition.
+
+Stored (2026-09-14, Turkey bbox 25.6 35.8 44.9 42.2): `chirps` 2018-01-01 to
+2026-09-10, 3175 days x 8 tiles, 181 MB, no missing day (Sep 2026 still prelim);
+`modis_lst` 2026-01-01 to 2026-08-28, 72k tiles, 1.1 GB. MODIS has 25 days with
+no scene at all and Aqua misses 60 days: Planetary Computer itself returns zero
+items for those dates (checked), most of them Saturdays, so this is an upstream
+catalog gap, not a fetch failure; `--dry-run` cannot see it either (nothing to
+plan). Mean `cloud_pct` of LST tiles runs ~78% in January and ~40% in August.
+
+**`era5`** (optional extra: `pip install -e .[era5]`): ERA5 hourly single levels from
+Google's ARCO-ERA5 bucket, the only anonymous and current source of gridded 2 m air
+temperature, dewpoint, wind and radiation we found (ERA5-Land 0.1 deg sits behind
+Copernicus / DestinE accounts). 0.25 deg cells (~28 x 22 km over Turkey): a regional
+context layer, the coarsest in the vault. Stated deviations from the rules above:
+the source is Zarr, not COG, and it is chunked one hour x whole globe, so reading
+Turkey downloads the global chunk anyway, about 3 MB per hour per variable, ~350 MB
+per day for the six default bands, while the stored tiles are a few hundred KB.
+Bandwidth, not disk.
+
+```bash
+geovault ingest --dataset era5 --bbox 25.6 35.8 44.9 42.2 --start 2026-06-01 --end 2026-06-30
+geovault ingest --dataset era5 --bbox ... --start ... --end ... --bands t2m d2m tp u10 v10 ssrd sp swvl1
+```
+
+One tile per HOUR, `date` = `YYYY-MM-DDTHH`; a `date` prefix of `YYYY-MM-DD` in the
+reader returns the 24 hours, daily statistics are computed at read time and never
+stored. Values are RAW ERA5 units (K, m of water, J m-2 per hour, m s-1, Pa,
+m3 m-3), nodata -9999. Band codes follow ECMWF short names (`t2m d2m tp u10 v10
+ssrd` default; `sp msl tcc skt e pev sd i10fg swvl1-4 stl1 mx2t mn2t` on request).
+Lattice: cell centres sit on the 0.25 deg lines, so the anchor is (-0.125, -0.125);
+100 px tiles of 25 deg, Turkey is one tile. The final ERA5 ends about 3 months back,
+the preliminary ERA5T about a week back (both read from the store's attributes at
+search time); ERA5T hours are stored with `scene_id` `era5t` and replaced by the
+final `era5` rows on the next run once available, like CHIRPS prelim/final.
+
+**`era5land`, `era5land_daily` and `agera5`** (Copernicus CDS, free account, extra `pip install -e .[cds]`,
+credentials in `api/`): the 0.1 deg family (~11 x 9 km over Turkey). ERA5-Land is the
+hourly raw reanalysis, land only; AgERA5 is its daily agronomic reduction (v2.0), a
+derived product stored as published like CHIRPS. Second stated deviation from the
+rules: CDS is a request API (it assembles a NetCDF server-side and returns a file), not
+byte-range reads. One request per day per scene (`era5land`: all bands and 24 hours in
+one; `agera5`: one per variable with its statistics, run concurrently), area = the whole
+10 deg tiles the AOI touches, so stored tiles are always complete. Measured: a day of
+Turkey answered in tens of seconds; the service is queued and may take minutes under
+load. Re-running an ingest retries only what is missing, as everywhere.
+
+```bash
+geovault ingest --dataset era5land --bbox 25.6 35.8 44.9 42.2 --start 2026-06-01 --end 2026-06-30
+geovault ingest --dataset agera5   --bbox 25.6 35.8 44.9 42.2 --start 2026-01-01 --end 2026-09-01
+geovault ingest --dataset agera5   --bbox ... --start ... --end ... --bands t2m_mean t2m_max t2m_min rh_12 tp ssr
+```
+
+`era5land` rows are per HOUR (`date` = `YYYY-MM-DDTHH`), raw ERA5-Land units, nodata -9999
+(sea too). Accumulated fields (`tp`, `ssrd`, `strd`, `e`, `pev`, `ro`) hold the running total
+since 00 UTC of the same day: hour 00 carries the previous day's 24 h total, hourly amounts
+are differences of consecutive hours, derived by the reader. Preliminary ERA5T hours are
+stored with `scene_id` `era5t` (from the response's `expver`), and a re-run re-fetches
+ERA5T days older than 60 days so the final `era5land` rows replace them. Bands: `t2m d2m
+tp u10 v10 ssrd swvl1 swvl2` default; `strd sp skt e pev ro sd sf swvl3 swvl4 stl1 stl2
+lai_hv lai_lv` on request.
+
+`era5land_daily` rows are per DAY in the LOCAL calendar day (`TIME_ZONE` utc+03:00 for
+Turkey): the CDS daily-statistics service reduces the hourly fields server-side, one request per
+band and day. Bands are `<variable>_<mean|min|max>` of the ERA5-Land instantaneous fields
+(`t2m d2m u10 v10 sp skt swvl1-4 stl1 stl2 lai_hv lai_lv`); the service refuses the ACCUMULATED
+fields (precipitation, radiation, evaporation, runoff, snowfall), so daily rain and radiation
+come from `agera5` or by differencing the hourly `era5land` store. Default bands: `t2m_mean
+t2m_min t2m_max d2m_mean u10_mean v10_mean swvl1_mean swvl2_mean skt_max skt_min`.
+
+```bash
+geovault ingest --dataset era5land_daily --bbox 25.6 35.8 44.9 42.2 --start 2026-01-01 --end 2026-09-08
+```
+
+`agera5` rows are per DAY. Bands are `<variable>_<statistic>`: `t2m_mean t2m_max t2m_min
+t2m_dmax t2m_dmean t2m_nmin t2m_nmean` (K), `rh_06 rh_09 rh_12 rh_15 rh_18` (% at local
+hours), `d2m_mean` (K), `vp_mean` (hPa), `ws10_mean` (m/s), `tcc_mean`, `tp` (mm/day),
+`ssr` (J m-2 day-1), `sd`. Grid note: the CDS area subsetter drops the northern and western
+edge rows for this dataset, so the request is padded one cell on those sides.
+
+```python
+series("chirps", lon, lat, "precip", date="2026")            # mm/day per day
+series("modis_lst", lon, lat, "aqua_lst_day", date="2026-08") # raw DN, * 0.02 = K
+series("era5", lon, lat, "t2m", date="2026-06-01")              # 24 hourly values, K
+series("era5land", lon, lat, "t2m", date="2026-06-01")          # same at 0.1 deg
+series("agera5", lon, lat, "t2m_max", date="2026-06")           # daily maxima, K
+series("era5land_daily", lon, lat, "swvl1_mean", date="2026-06") # daily mean topsoil moisture, m3/m3
+```
 
 Static datasets need no date range:
 
@@ -126,6 +263,22 @@ clip("soilgrids", "parcel.geojson", "clay_0-5cm", "")
 Adding a dataset is one module under `src/geovault/sources/` (a `search` and an
 `ingest_scene` function) plus one line in the registry. The engine (grid, store,
 catalog, reader) never changes.
+
+## Credentials (only for non-anonymous sources)
+
+Everything in the source table above is anonymous except the ERA5-Land family:
+`era5land` (hourly), `era5land_daily` (daily statistics) and `agera5` (AgERA5 daily
+agrometeorological indicators) pull from the Copernicus Climate Data Store, which needs
+a free account.
+Keys live in `api/` and are git-ignored; only the `*.example` templates are committed:
+
+```bash
+cp api/cdsapirc.example api/cdsapirc     # then paste your CDS Personal Access Token
+```
+
+See `api/README.md` for the lookup order (repo `api/`, then `~/.cdsapirc`, then
+`CDSAPI_URL` / `CDSAPI_KEY`) and the dataset licences you must accept once on the
+CDS website.
 
 ## Install
 
@@ -291,6 +444,10 @@ each provider's terms and license before fetching or publishing anything:
 | Copernicus GLO-30 DEM | Copernicus DEM license (ESA / Airbus terms) |
 | ESA WorldCover | CC BY 4.0, attribution required |
 | SoilGrids (ISRIC) | CC BY 4.0, attribution required |
+| CHIRPS 2.0 | Public domain (CHC/UCSB); cite Funk et al. 2015 |
+| MODIS MOD11A1/MYD11A1 | NASA LP DAAC, free; cite Wan et al., attribution requested |
+| ERA5 (ARCO-ERA5 mirror) | Copernicus Climate Change Service (C3S) licence: free use with attribution ("Generated using Copernicus Climate Change Service information"); ARCO mirror by Google Research |
+| ERA5-Land, AgERA5 (CDS) | C3S licence as above, accepted once per dataset on the CDS website; your account, your requests |
 | AWS Open Data buckets | Each dataset's own terms apply, see the registry entry |
 | Microsoft Planetary Computer | Microsoft APIs terms of use, per-collection licenses |
 

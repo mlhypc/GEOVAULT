@@ -18,6 +18,10 @@ dependencies = [
     "shapely>=2.0",
 ]
 
+[project.optional-dependencies]
+era5 = ["zarr>=3.0", "gcsfs>=2024.0"]                       # ARCO-ERA5 adapter only
+cds = ["cdsapi>=0.7", "xarray>=2024.0", "netCDF4>=1.6", "h5netcdf>=1.3"]   # era5land + agera5 (Copernicus CDS account)
+
 [project.scripts]
 geovault = "geovault.cli:main"
 
