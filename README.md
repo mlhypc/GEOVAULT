@@ -50,6 +50,7 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 | `s1` | Sentinel-1 RTC (terrain-corrected gamma0), VV/VH, 10 m | Microsoft Planetary Computer | none |
 | `landsat` | Landsat Collection 2 Level-2 (L4-5 TM, 7 ETM+, 8-9 OLI/TIRS), surface reflectance + surface temperature, 30 m, 1982 to today | Microsoft Planetary Computer | none |
 | `glo30` | Copernicus GLO-30 DEM, 30 m, static | AWS open data COG | none |
+| `glo90` | Copernicus GLO-90 DEM, 90 m, static (same product family as GLO-30, ~1/8 the transfer per cell; for basemap-grade elevation, not per-parcel precision) | AWS open data COG | none |
 | `worldcover` | ESA WorldCover 2021, 10 m land cover, static | AWS open data COG | none |
 | `soilgrids` | SoilGrids 250 m soil properties (11 props x 6 depths), static | ISRIC VRT/COG | none |
 | `chirps` | CHIRPS 2.0 daily precipitation, 0.05 deg (~5 km), mm/day, 1981 to ~2 days ago | UCSB Climate Hazards Center (gzipped GeoTIFF per day) | none |
@@ -232,7 +233,9 @@ geovault ingest --dataset soilgrids --geojson parcel.geojson --bands clay_0-5cm 
 
 Copernicus GLO-30 is not published for every country: the public bucket has no
 cells over e.g. Azerbaijan and Armenia (HTTP 404), so parcels there get no DEM
-tiles and the ingest reports them as missing assets, not as an error.
+tiles and the ingest reports them as missing assets, not as an error. GLO-90
+(`glo90`) is the same product family, coarser (3 arc second vs 1), from a
+separate AWS bucket; same missing-cell behaviour.
 
 SoilGrids is stored in its native Goode Homolosine projection (no resampling);
 the reader's clip reprojects the polygon, not the pixels. Its bands are
@@ -441,7 +444,7 @@ each provider's terms and license before fetching or publishing anything:
 |------|--------------------------|
 | Sentinel-1 / Sentinel-2 | Copernicus Sentinel data legal notice (free use with attribution: "Contains modified Copernicus Sentinel data") |
 | Landsat Collection 2 | USGS, public domain; attribution requested: "Landsat imagery courtesy of the U.S. Geological Survey" |
-| Copernicus GLO-30 DEM | Copernicus DEM license (ESA / Airbus terms) |
+| Copernicus GLO-30 / GLO-90 DEM | Copernicus DEM license (ESA / Airbus terms) |
 | ESA WorldCover | CC BY 4.0, attribution required |
 | SoilGrids (ISRIC) | CC BY 4.0, attribution required |
 | CHIRPS 2.0 | Public domain (CHC/UCSB); cite Funk et al. 2015 |
