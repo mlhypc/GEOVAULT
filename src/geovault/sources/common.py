@@ -5,7 +5,6 @@ range-read exactly the tile windows we need from public COGs. All derivation
 (cloud share, indices) happens locally.
 """
 
-import io
 import math
 
 import numpy as np
@@ -35,28 +34,58 @@ def read_tile_window(ds, grid, tx, ty, nodata):
     return arr
 
 
-def encode_geotiff(arr, grid, tx, ty, crs, nodata, scale=None, offset=None) -> bytes:
-    """Encode one tile array as a DEFLATE GeoTIFF blob (lossless, self-describing).
-
-    scale/offset, when given, are written as the GeoTIFF band scale and offset: the
-    stored digital number stays raw (lossless) but the blob documents how to turn it
-    into a physical value (Landsat Collection 2: reflectance and kelvin). Readers get
-    them from rasterio as ds.scales[0] / ds.offsets[0]."""
-    transform = Affine(*grid.tile_transform(tx, ty))
-    buf = io.BytesIO()
+def _encode(arr, crs, transform, nodata, scale=None, offset=None, predictor=2) -> bytes:
     with rasterio.MemoryFile() as mem:
         with mem.open(
-            driver="GTiff", width=grid.tile_px, height=grid.tile_px, count=1,
+            driver="GTiff", width=arr.shape[1], height=arr.shape[0], count=1,
             dtype=arr.dtype, crs=crs, transform=transform, nodata=nodata,
-            compress="deflate", predictor=2,
+            compress="deflate", predictor=predictor,
         ) as dst:
             dst.write(arr, 1)
             if scale is not None:
                 dst.scales = [float(scale)]
             if offset is not None:
                 dst.offsets = [float(offset)]
-        buf.write(mem.read())
-    return buf.getvalue()
+        return mem.read()
+
+
+def encode_blob(arr, crs, transform, nodata, scale=None, offset=None) -> bytes:
+    """DEFLATE GeoTIFF blob of one tile (lossless), choosing the TIFF predictor per tile.
+
+    Integer tiles use the horizontal differencing predictor (2). Float tiles are encoded
+    with both predictor 2 and the floating-point predictor (3) and the smaller blob is kept:
+    3 wins on smooth continuous fields (reanalysis temperature -17%, S1 gamma0 -7%) and
+    loses on sparse quantised ones (precipitation +30%), so neither is right for all bands.
+    The choice is recorded in the TIFF itself; any reader decodes both."""
+    if np.issubdtype(arr.dtype, np.floating):
+        b2 = _encode(arr, crs, transform, nodata, scale, offset, 2)
+        b3 = _encode(arr, crs, transform, nodata, scale, offset, 3)
+        return b3 if len(b3) < len(b2) else b2
+    return _encode(arr, crs, transform, nodata, scale, offset, 2)
+
+
+def encode_geotiff(arr, grid, tx, ty, crs, nodata, scale=None, offset=None) -> bytes:
+    """Encode one grid tile array as a DEFLATE GeoTIFF blob (lossless, self-describing).
+
+    scale/offset, when given, are written as the GeoTIFF band scale and offset: the
+    stored digital number stays raw (lossless) but the blob documents how to turn it
+    into a physical value (Landsat Collection 2: reflectance and kelvin). Readers get
+    them from rasterio as ds.scales[0] / ds.offsets[0]."""
+    return encode_blob(arr, crs, Affine(*grid.tile_transform(tx, ty)), nodata, scale, offset)
+
+
+def reencode_blob(blob: bytes) -> bytes:
+    """Re-encode a stored blob with the current encoder, keeping pixels, georeferencing,
+    nodata and scale/offset bit-for-bit. Used by `geovault reencode` to bring old rows to
+    the current encoding choice; returns the original when it is already the smaller."""
+    with rasterio.MemoryFile(blob) as mem:
+        with mem.open() as ds:
+            arr = ds.read(1)
+            crs, transform, nodata = ds.crs, ds.transform, ds.nodata
+            scale = ds.scales[0] if ds.scales and ds.scales[0] != 1.0 else None
+            offset = ds.offsets[0] if ds.offsets and ds.offsets[0] != 0.0 else None
+    out = encode_blob(arr, crs, transform, nodata, scale, offset)
+    return out if len(out) < len(blob) else blob
 
 
 from functools import lru_cache

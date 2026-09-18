@@ -119,3 +119,33 @@ def test_progress_and_duration_format():
         s = p.tick()
     assert p.done == 4 and s.endswith("eta 0s")
     assert p.summary().startswith("4/4 in ")
+
+
+def test_encode_blob_picks_smaller_predictor_and_reencode_is_lossless():
+    import numpy as np
+    import rasterio
+    from geovault.grid import Grid
+    from geovault.sources.common import encode_geotiff, reencode_blob, _encode
+    from rasterio.transform import Affine
+    g = Grid("EPSG:4326", 0.1, 100, -0.05, -0.05)
+    rng = np.random.default_rng(0)
+    yy, xx = np.mgrid[0:100, 0:100]
+    smooth = (280 + 0.01 * xx + 0.02 * yy + rng.normal(0, 0.001, (100, 100))).astype(np.float32)
+    sparse = np.where(rng.random((100, 100)) < 0.05, rng.integers(1, 700, (100, 100)) / 100, 0).astype(np.float32)
+    tr = Affine(*g.tile_transform(3, 4))
+    for arr in (smooth, sparse):
+        blob = encode_geotiff(arr, g, 3, 4, "EPSG:4326", -9999)
+        assert len(blob) == min(len(_encode(arr, "EPSG:4326", tr, -9999, predictor=p)) for p in (2, 3))
+        with rasterio.MemoryFile(blob) as m, m.open() as ds:
+            assert np.array_equal(ds.read(1), arr)
+    # an old-style predictor-2 blob re-encodes to the same pixels and metadata, never larger
+    old = _encode(smooth, "EPSG:4326", tr, -9999, 0.5, -1.0, predictor=2)
+    new = reencode_blob(old)
+    assert len(new) <= len(old)
+    with rasterio.MemoryFile(new) as m, m.open() as ds:
+        assert np.array_equal(ds.read(1), smooth)
+        assert ds.nodata == -9999 and ds.transform == tr and ds.crs.to_epsg() == 4326
+        assert ds.scales[0] == 0.5 and ds.offsets[0] == -1.0
+    assert reencode_blob(new) == new
+    u16 = rng.integers(0, 10000, (100, 100)).astype(np.uint16)
+    assert reencode_blob(encode_geotiff(u16, g, 3, 4, "EPSG:32636", 0)) == encode_geotiff(u16, g, 3, 4, "EPSG:32636", 0)

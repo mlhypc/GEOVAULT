@@ -237,6 +237,70 @@ def _compact_month_locked(dataset: str, res: float, date: str, target):
     return target
 
 
+def reencode_month(dataset: str, res: float, date: str, workers: int = 8, wait: bool = True):
+    """Rewrite one (res, month) with every blob re-encoded by the current encoder
+    (sources.common.reencode_blob): pixels, georeferencing and nodata stay bit-for-bit,
+    only the compression choice changes. Merges open parts like compaction (newest
+    fetched_at wins) and seals the month. Returns (rows, bytes_before, bytes_after), or
+    None when the month is empty or locked by another process."""
+    from concurrent.futures import ThreadPoolExecutor
+    from .sources.common import reencode_blob
+    target = month_dir(dataset, date) / f"r{int(res)}.parquet"
+    lock = _MonthLock(target.with_suffix(".parquet.lock"), wait)
+    if not lock.acquire():
+        return None
+    try:
+        files = month_files(dataset, res, date)
+        if not files:
+            return None
+        lst = ", ".join(f"'{f.as_posix()}'" for f in files)
+        cols = ", ".join(COLS)
+        con = duckdb.connect()
+        rows = con.execute(
+            f"SELECT {cols} FROM ("
+            f"  SELECT {cols}, row_number() OVER "
+            f"    (PARTITION BY band, date, x, y ORDER BY fetched_at DESC) rn"
+            f"  FROM read_parquet([{lst}], union_by_name=true)) WHERE rn = 1 "
+            f"ORDER BY band, date, x, y").fetchall()
+        i_data, i_size = COLS.index("data"), COLS.index("size_bytes")
+        before = sum(len(r[i_data]) for r in rows)
+        with ThreadPoolExecutor(max_workers=workers) as ex:   # GDAL releases the GIL in codecs
+            blobs = list(ex.map(lambda r: reencode_blob(bytes(r[i_data])), rows))
+        out = []
+        for r, b in zip(rows, blobs):
+            r = list(r)
+            r[i_data], r[i_size] = b, len(b)
+            out.append(r)
+        after = sum(len(b) for b in blobs)
+        tmp = target.with_suffix(".parquet.tmp")
+        con.execute(f"CREATE OR REPLACE TABLE buf ({SCHEMA})")
+        con.executemany(f"INSERT INTO buf VALUES ({', '.join('?' for _ in COLS)})", out)
+        con.execute(
+            f"COPY (SELECT * FROM buf ORDER BY band, date, x, y) "
+            f"TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 256)")
+        con.close()
+        for f in files:
+            f.unlink(missing_ok=True)
+        tmp.replace(target)
+        return len(rows), before, after
+    finally:
+        lock.release()
+
+
+def months(dataset: str) -> list:
+    """Every (res, date) group of a dataset, static as (res, '')."""
+    import re
+    out = set()
+    for f in (STORE / f"dataset={dataset}").rglob("r*.parquet"):
+        m = re.match(r"r(\d+)\.(?:part-[0-9a-f]+\.)?parquet$", f.name)
+        if not m:
+            continue
+        rel = f.parent.relative_to(STORE / f"dataset={dataset}").as_posix()
+        date = "" if rel == "static" else rel.replace("/", "-") + "-01"
+        out.add((float(m.group(1)), date))
+    return sorted(out, key=lambda k: (k[1], k[0]))
+
+
 def compact(dataset: str) -> list:
     """Compact every (res, month) of a dataset that has open part files."""
     import re

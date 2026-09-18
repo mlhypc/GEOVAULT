@@ -29,7 +29,9 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
    Earth's BulkMetadata design, which we reverse-engineered before building this.)
 2. **Few big immutable files.** One Parquet per (dataset, month, resolution
    group); each row is a tile, pixels stored as a DEFLATE GeoTIFF blob. Rows are
-   sorted (band, date, x, y) so DuckDB row-group statistics prune reads.
+   sorted (band, date, x, y) so DuckDB row-group statistics prune reads. Float tiles
+   are encoded with both TIFF predictors (2 horizontal, 3 floating-point) and the
+   smaller blob kept; see [Blob encoding](#blob-encoding).
 3. **Zero remote compute.** STAC search plus HTTP range reads from public COGs.
    Cloud share and every other derivation is computed locally. No quotas.
 4. **Data is lossless and native.** Native CRS, native pixel grid, no resampling
@@ -59,6 +61,25 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 | `era5land` | ERA5-Land reanalysis, hourly, 0.1 deg, land only, 1950 to ~5 days ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
 | `era5land_daily` | ERA5-Land daily mean/min/max of the instantaneous fields (temperature, dewpoint, wind, soil moisture, skin temperature), local time zone, 0.1 deg | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
 | `agera5` | AgERA5 v2 daily agrometeorological indicators (Tmean/max/min, RH at fixed hours, dewpoint, wind, solar, precipitation), 0.1 deg, 1979 to ~1 week ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
+
+### What this vault holds (2026-09-18)
+
+The code covers every dataset above; the local store on this machine currently
+holds (AOI: Turkey bbox 25.6 35.8 44.9 42.2 unless noted):
+
+| Dataset | Stored range | Tiles | On disk |
+|---------|--------------|-------|---------|
+| `s2` | 2018-06-01 to 2026-09-06 (placement parcels AOI) | 20k | 1.7 GB |
+| `s1` | 2018-11-01 to 2026-09-04 (placement parcels AOI) | 15k | 3.0 GB |
+| `landsat` | 2000-01-13 to 2026-08-24 (placement parcels AOI) | 36k | 2.7 GB |
+| `glo30` / `glo90` | static | 593 / 3121 | 96 / 429 MB |
+| `soilgrids` | static, 61 bands | 19k | 857 MB |
+| `chirps` | 2010-01-01 to 2026-09-10 | 49k | 322 MB |
+| `modis_lst` | 2026-01-01 to 2026-08-28 | 72k | 1.1 GB |
+| `agera5` | 2008-01-01 to 2026-08-31, 12 bands | 405k | 7.9 GB |
+| `worldcover`, `era5`, `era5land`, `era5land_daily` | not ingested yet (adapters tested, store empty) | | |
+
+Total 18 GB. `geovault coverage <dataset>` prints the live version of this table.
 
 ### Landsat
 
@@ -135,8 +156,8 @@ every scene is 5 x 5 whole tiles). Turkey is MODIS tiles h20v04, h20v05,
 h21v04, h21v05: 8 scenes per day. Planetary Computer publishes MODIS about
 2-3 weeks after acquisition.
 
-Stored (2026-09-14, Turkey bbox 25.6 35.8 44.9 42.2): `chirps` 2018-01-01 to
-2026-09-10, 3175 days x 8 tiles, 181 MB, no missing day (Sep 2026 still prelim);
+Stored (2026-09-18, Turkey bbox 25.6 35.8 44.9 42.2): `chirps` 2010-01-01 to
+2026-09-10, 6097 days x 8 tiles, 322 MB, no missing day (Sep 2026 still prelim);
 `modis_lst` 2026-01-01 to 2026-08-28, 72k tiles, 1.1 GB. MODIS has 25 days with
 no scene at all and Aqua misses 60 days: Planetary Computer itself returns zero
 items for those dates (checked), most of them Saturdays, so this is an upstream
@@ -309,6 +330,7 @@ geovault ingest --dataset s2 --bbox 35.30 36.71 35.33 36.73 \
 geovault ingest ... --dry-run            # same arguments: report what is still missing, fetch nothing
 geovault coverage s2 --date 2024-06     # what is stored
 geovault compact s2                     # seal open month part files (a finished ingest does this itself)
+geovault reencode agera5                # re-compress stored tiles with the current encoder (lossless)
 geovault rebuild-catalog s2             # regenerate the catalog from the store
 ```
 
@@ -421,6 +443,33 @@ it touched**, so part files exist only while a run is in progress (or after a
 crash). `geovault compact <dataset>` does the same on demand and doubles as crash
 repair. Readers go through the catalog's `file` column, so parts are transparent
 to them either way.
+
+### Blob encoding
+
+Every tile is a single-band DEFLATE GeoTIFF; the codec choice is lossless and per
+tile. Integer tiles (S2, Landsat, MODIS, WorldCover) use predictor 2. Float tiles
+are encoded twice, with predictor 2 and with the floating-point predictor 3, and the
+smaller one is stored (the choice is a TIFF tag, so any reader decodes either).
+Measured on Turkey tiles: predictor 3 is 12-17% smaller on smooth continuous fields
+(AgERA5 temperatures, ET0, radiation; S1 gamma0 -7%) and 30% LARGER on sparse
+quantised ones (precipitation), which is why neither is right for a whole dataset.
+
+Where the volume comes from, measured on AgERA5 (9.6 GB of blobs before the predictor
+choice, 8.5 GB after, for 12 bands x 6 tiles x 18.7 years; 21 KB per 100 x 100 float32
+tile): the source NetCDF itself is 48 KB for
+the same tile (zlib + shuffle), and the values are full float32 with no quantisation
+(unique-value step = one float32 ulp), so the size is the entropy of the data, not a
+conversion overhead. The only large lever left is lossy: rounding the mantissa to 16
+bits (max error 0.002 K on temperature, 8e-6 relative) would save a further ~35%,
+14 bits (0.008 K) ~45%. The vault does not do this; the lossless rule stands.
+
+`geovault reencode <dataset>` rewrites every stored tile with the current encoder,
+month by month (merging open parts like compaction, taking the same lock), and keeps
+a blob only when the new encoding is smaller. Pixels, georeferencing, nodata and
+scale/offset are unchanged bit-for-bit; run it after an encoder change to bring old
+rows up to date. Done 2026-09-18: `agera5` 404k tiles 9.62 -> 8.52 GB (-11%, 17 min),
+`s1` 15k tiles 3.47 -> 3.22 GB (-7%). `chirps` gains nothing (predictor 2 already wins
+on precipitation) and is left as is.
 
 ### UTM zone boundary rule
 

@@ -4,6 +4,7 @@
   geovault ingest --dataset s2 --bbox 35.30 36.71 35.33 36.73 --start ... --end ... [--cloud-max 80]
   geovault coverage s2 [--bbox W S E N] [--date 2024-06]
   geovault compact s2
+  geovault reencode agera5          # re-compress stored tiles with the current encoder (lossless)
   geovault rebuild-catalog s2
 
 Also runnable as: python -m geovault ...
@@ -15,7 +16,8 @@ import time
 
 from . import catalog
 from .sources import REGISTRY
-from .store import Writer, compact
+from .store import Writer, compact, reencode_month
+from . import store as _store
 
 
 def main(argv=None):
@@ -55,11 +57,37 @@ def main(argv=None):
     p = sub.add_parser("rebuild-catalog", help="regenerate the catalog from the store")
     p.add_argument("dataset")
 
+    p = sub.add_parser("reencode", help="re-compress every stored tile of a dataset with the current "
+                                        "encoder (lossless; pixels unchanged), month by month")
+    p.add_argument("dataset")
+    p.add_argument("--workers", type=int, default=8, help="tiles encoded concurrently per month (default 8)")
+
     a = ap.parse_args(argv)
 
     if a.cmd == "compact":
         done = compact(a.dataset)
         print(f"compacted {len(done)} (res, month) groups")
+        catalog.rebuild(a.dataset)
+        return 0
+
+    if a.cmd == "reencode":
+        groups = _store.months(a.dataset)
+        tb = ta = n = 0
+        t0 = time.time()
+        for i, (res, date) in enumerate(groups, 1):
+            r = reencode_month(a.dataset, res, date, workers=a.workers)
+            if r is None:
+                print(f"  [{i}/{len(groups)}] {date[:7] or 'static'} r{int(res)}: skipped (empty or locked)")
+                continue
+            rows, before, after = r
+            n += rows
+            tb += before
+            ta += after
+            print(f"  [{i}/{len(groups)}] {date[:7] or 'static'} r{int(res)}: {rows} tiles "
+                  f"{before / 1e6:.1f} -> {after / 1e6:.1f} MB ({(after - before) / max(before, 1) * 100:+.0f}%)"
+                  f"  {time.time() - t0:.0f}s", flush=True)
+        print(f"reencoded {n} tiles: {tb / 1e9:.2f} -> {ta / 1e9:.2f} GB "
+              f"({(ta - tb) / max(tb, 1) * 100:+.0f}%)")
         catalog.rebuild(a.dataset)
         return 0
 
