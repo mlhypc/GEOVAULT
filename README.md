@@ -180,6 +180,13 @@ one; `agera5`: one per variable with its statistics, run concurrently), area = t
 Turkey answered in tens of seconds; the service is queued and may take minutes under
 load. Re-running an ingest retries only what is missing, as everywhere.
 
+CDS can also reject a scene outright with `400 ... Number queued requests for this
+dataset is temporarily limited`, when too many jobs are queued for the dataset at once
+(default `--workers 3` scenes in parallel, each already running up to 4 concurrent
+variable requests inside `agera5`, so 12 simultaneous submissions). Not a fixed rule —
+the same range has ingested cleanly before at the default. If you see this error,
+re-run the same command with `--workers 1` to drop the cross-scene concurrency.
+
 ```bash
 geovault ingest --dataset era5land --bbox 25.6 35.8 44.9 42.2 --start 2026-06-01 --end 2026-06-30
 geovault ingest --dataset agera5   --bbox 25.6 35.8 44.9 42.2 --start 2026-01-01 --end 2026-09-01

@@ -165,7 +165,7 @@ def main(argv=None):
     total = 0
     written = {}
     failed = []               # (scene_id, error) for scenes whose ingest raised
-    FLUSH_EVERY = 25          # scenes per chunk; an interrupted run keeps every finished chunk
+    FLUSH_EVERY = 10          # scenes per chunk; an interrupted run keeps every finished chunk
     SCENE_WORKERS = a.workers # scenes fetched concurrently (each scene fans out over its bands)
     from concurrent.futures import ThreadPoolExecutor
 
