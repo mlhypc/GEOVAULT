@@ -64,13 +64,25 @@ def month_files(dataset: str, res: float, date: str) -> list:
 
 
 class Writer:
-    """Buffers rows in memory; close() appends them as new part files."""
+    """Buffers rows in memory and appends them to the store as new part files.
 
-    def __init__(self, dataset: str):
+    The buffer is flushed to disk on its own once it holds more than `max_buffer_mb` of tile
+    blobs (a Turkey-wide WorldCover ingest once sat on 900 MB of RAM for two hours and would
+    have lost all of it to a crash), at every explicit flush(), and at close(). close() also
+    auto-compacts the (res, month) groups that have grown past AUTO_COMPACT_PARTS."""
+
+    def __init__(self, dataset: str, max_buffer_mb: float = 256.0, log=None):
         self.dataset = dataset
+        self.max_buffer_bytes = int(max_buffer_mb * 1e6)
+        self.log = log                      # callable taking one line, e.g. logger.info
         self.rows = []
-        self.seen = {}      # (band, date, x, y) -> (row index, valid_px, scene_id) buffered this session
-        self._lock = threading.Lock()   # add() is called from concurrent scene workers
+        self.buffered_bytes = 0             # blob bytes in self.rows
+        self.seen = {}      # (band, date, x, y) -> (row index or None when flushed, valid_px, scene_id)
+        self.written = {}   # part file -> rows, everything this Writer wrote to disk
+        self.touched = set()                # (res, month date) groups with a part written by us
+        self._last_fetched_at = 0
+        self._lock = threading.Lock()       # add() is called from concurrent scene workers
+        self._flush_lock = threading.Lock() # one flush at a time; others keep buffering meanwhile
 
     def add(self, band, date, x, y, crs, res, tile_px, wgs84_bounds, nodata,
             cloud_pct, scene_id, blob: bytes, valid_px: int | None = None) -> bool:
@@ -78,16 +90,21 @@ class Writer:
         scenes of the same day (adjacent MGRS granules overlap at their edges, and
         the edge granule holds a partially empty tile): the tile with MORE valid
         pixels wins, whatever order the scenes were fetched in, so concurrent
-        ingests are deterministic. Returns True when the buffer gained a new key."""
+        ingests are deterministic. A better tile for a key that was already flushed is
+        appended again; compaction keeps the newest fetched_at, which is this one.
+        Returns True when the buffer gained a new key."""
         key = (band, date, x, y)
         w, s, e, n = wgs84_bounds
         row = dict(
             band=band, date=date, x=x, y=y, crs=crs, res=float(res), tile_px=tile_px,
             west=w, south=s, east=e, north=n, nodata=nodata, cloud_pct=cloud_pct,
-            scene_id=scene_id, data=blob, size_bytes=len(blob),
-            fetched_at=int(time.time() * 1000),
+            scene_id=scene_id, data=blob, size_bytes=len(blob), fetched_at=0,
         )
         with self._lock:
+            # strictly increasing within the process, so "newest fetched_at wins" at compaction
+            # means "last added wins" even for tiles added in the same millisecond
+            self._last_fetched_at = max(int(time.time() * 1000), self._last_fetched_at + 1)
+            row["fetched_at"] = self._last_fetched_at
             prev = self.seen.get(key)
             if prev is not None:
                 idx, prev_valid, prev_scene = prev
@@ -97,12 +114,67 @@ class Writer:
                 tie = (valid_px == prev_valid and scene_id is not None and prev_scene is not None
                        and str(scene_id) < str(prev_scene))
                 if better or tie:
-                    self.rows[idx] = row
-                    self.seen[key] = (idx, valid_px, scene_id)
+                    if idx is None:                 # the loser is already on disk
+                        self.seen[key] = (len(self.rows), valid_px, scene_id)
+                        self.rows.append(row)
+                        self.buffered_bytes += len(blob)
+                    else:
+                        self.buffered_bytes += len(blob) - self.rows[idx]["size_bytes"]
+                        self.rows[idx] = row
+                        self.seen[key] = (idx, valid_px, scene_id)
                 return False
             self.seen[key] = (len(self.rows), valid_px, scene_id)
             self.rows.append(row)
+            self.buffered_bytes += len(blob)
+            full = self.buffered_bytes >= self.max_buffer_bytes
+        if full:
+            self.flush()
         return True
+
+    def flush(self) -> dict:
+        """Write the buffered rows as new part files (one per (res, month)). Returns
+        {part file: rows} for this flush; nothing is compacted here."""
+        with self._flush_lock:
+            with self._lock:
+                rows, self.rows = self.rows, []
+                nbytes, self.buffered_bytes = self.buffered_bytes, 0
+                for key, (idx, valid_px, scene_id) in self.seen.items():
+                    if idx is not None:
+                        self.seen[key] = (None, valid_px, scene_id)
+            if not rows:
+                return {}
+            written = self._write_parts(rows)
+            for f, n in written.items():
+                self.written[f] = self.written.get(f, 0) + n
+                if self.log:
+                    self.log(f"  flushed {n} rows ({nbytes / 1e6:.0f} MB) to {f.name}")
+        return written
+
+    def _write_parts(self, rows) -> dict:
+        by_group = {}          # one part file per (res, MONTH): the store is partitioned by month,
+        for r in rows:         # a part per date would mean dozens of tiny files per flush
+            by_group.setdefault((r["res"], r["date"][:7] + "-01" if r["date"] else ""), []).append(r)
+        written = {}
+        con = duckdb.connect()
+        for (res, date), group in by_group.items():
+            d = month_dir(self.dataset, date)
+            d.mkdir(parents=True, exist_ok=True)
+            f = d / f"r{int(res)}.part-{uuid.uuid4().hex[:8]}.parquet"
+            con.execute(f"CREATE OR REPLACE TABLE buf ({SCHEMA})")
+            con.executemany(
+                f"INSERT INTO buf VALUES ({', '.join('?' for _ in COLS)})",
+                [[r[c] for c in COLS] for r in group],
+            )
+            # Small row groups (256 tiles, ~12 MB of blobs) over a band/x/y sort: a reader asking for one
+            # band and a bbox touches a few row groups via their min/max stats instead of decompressing
+            # the whole file. With one row group per file a 900 MB static layer cost 0.5 s per map tile.
+            con.execute(
+                f"COPY (SELECT * FROM buf ORDER BY band, date, x, y) "
+                f"TO '{f.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 256)")
+            written[f] = len(group)
+            self.touched.add((res, date))
+        con.close()
+        return written
 
     def existing_keys(self, res: float, months: list) -> set:
         """(band, date, x, y) already stored for this dataset/res in the given months."""
@@ -119,38 +191,13 @@ class Writer:
         return set(rows)
 
     def close(self) -> dict:
-        """Append buffered rows as new part files, then auto-compact any
-        (res, month) that has grown past AUTO_COMPACT_PARTS."""
+        """Flush, then auto-compact any touched (res, month) that has grown past
+        AUTO_COMPACT_PARTS. Returns {part file: rows} of the final flush only; the
+        whole session's output is in self.written. The Writer stays usable after close()
+        (the dated ingest path closes it after every chunk of scenes)."""
+        written = self.flush()
         with self._lock:
-            rows, self.rows, self.seen = self.rows, [], {}
-        if not rows:
-            return {}
-        by_group = {}          # one part file per (res, MONTH): the store is partitioned by month,
-        for r in rows:         # a part per date would mean dozens of tiny files per flush
-            by_group.setdefault((r["res"], r["date"][:7] + "-01" if r["date"] else ""), []).append(r)
-
-        written = {}
-        con = duckdb.connect()
-        touched = set()
-        for (res, date), rows in by_group.items():
-            d = month_dir(self.dataset, date)
-            d.mkdir(parents=True, exist_ok=True)
-            f = d / f"r{int(res)}.part-{uuid.uuid4().hex[:8]}.parquet"
-            con.execute(f"CREATE OR REPLACE TABLE buf ({SCHEMA})")
-            con.executemany(
-                f"INSERT INTO buf VALUES ({', '.join('?' for _ in COLS)})",
-                [[r[c] for c in COLS] for r in rows],
-            )
-            # Small row groups (256 tiles, ~12 MB of blobs) over a band/x/y sort: a reader asking for one
-            # band and a bbox touches a few row groups via their min/max stats instead of decompressing
-            # the whole file. With one row group per file a 900 MB static layer cost 0.5 s per map tile.
-            con.execute(
-                f"COPY (SELECT * FROM buf ORDER BY band, date, x, y) "
-                f"TO '{f.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 256)")
-            written[f] = len(rows)
-            touched.add((res, date))
-        con.close()
-
+            touched, self.touched = self.touched, set()
         for res, date in touched:
             if len(month_files(self.dataset, res, date)) > AUTO_COMPACT_PARTS:
                 # Skipped when another process is compacting the same month: two concurrent merges

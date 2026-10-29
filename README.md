@@ -336,8 +336,11 @@ geovault rebuild-catalog s2             # regenerate the catalog from the store
 
 Re-running an ingest is safe and cheap: cached tiles are skipped via the catalog,
 so the same command serves both the initial backfill and incremental top-ups.
-Long scene ingests write to disk every 25 scenes, so an interrupted run keeps
-what it fetched and the next run resumes from there.
+Tiles are written to disk every 10 scenes and, for any ingest, whenever the
+buffer exceeds `--flush-mb` (default 256 MB), so an interrupted run keeps what
+it fetched. After a crash: `geovault compact <dataset>` seals the part files
+left behind (the next ingest does this too), then re-run the same ingest
+command; it fetches only the tiles that are still missing.
 
 Failures are per scene, not per run: a scene whose fetch raises is reported as
 `FAILED`, the other scenes of its chunk are still written, the failed ids are
@@ -437,7 +440,9 @@ never invalidates data.
 ### Write pattern (hot month)
 
 Ingest is a cheap append: each flush writes a new `r<res>.part-<id>.parquet` and
-touches nothing else. Once a month spans more than 3 files it is auto-compacted
+touches nothing else. The Writer flushes every 10 scenes and whenever its buffer
+holds more than `--flush-mb` of tiles (default 256 MB; a 900 MB WorldCover run
+is four parts). Once a month spans more than 3 files it is auto-compacted
 into a single sealed file at close, and **every finished run seals all the months
 it touched**, so part files exist only while a run is in progress (or after a
 crash). `geovault compact <dataset>` does the same on demand and doubles as crash

@@ -7,33 +7,46 @@ to each source's own pixel grid via Grid.from_transform, so pixels are stored
 exactly as published, no resampling.
 """
 
+import os
+import time
+
 import rasterio
 
 from ..aoi import tile_filter
 from ..grid import Grid
+from ..log import Progress, fmt_duration
 from . import common
 
-import os
 _ENV = dict(AWS_NO_SIGN_REQUEST="YES", GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
             GDAL_HTTP_MULTIPLEX="YES", VSI_CACHE="TRUE")
 for _k, _v in _ENV.items():
     os.environ.setdefault(_k, _v)   # visible to every thread (rasterio.Env is thread-local)
 
+PROGRESS_EVERY = 5000   # tiles between progress lines inside one asset
 
 
 def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
                   nodata=None, source_id="", log=print) -> int:
-    """Open each asset, tile the part intersecting bbox/aoi, store the tiles."""
+    """Open each asset, tile the part intersecting bbox/aoi, store the tiles.
+
+    Progress goes to `log`: one line per asset (tiles, elapsed, rate, ETA over the assets)
+    and one every PROGRESS_EVERY tiles inside an asset, so a Turkey-wide WorldCover run
+    (20 assets, 290k tiles, two hours) is never silent for more than a few minutes."""
     skip_keys = skip_keys or set()
     in_aoi = tile_filter(aoi)
     written = 0
+    t0 = time.time()
+    prog = Progress(len(hrefs))
 
     with rasterio.Env(**_ENV):
-        for href in hrefs:
+        for i, href in enumerate(hrefs, 1):
+            name = href.rsplit("/", 1)[-1]
             try:
                 ds = rasterio.open(href)
             except rasterio.errors.RasterioIOError:
+                log(f"    [{i}/{len(hrefs)}] {name}: not found (open water)  | {prog.tick()}")
                 continue   # assets over open water simply do not exist
+            asset_written = 0
             with ds:
                 crs = str(ds.crs) if ds.crs.to_epsg() is None else f"EPSG:{ds.crs.to_epsg()}"
                 grid = Grid.from_transform(crs, ds.transform, tile_px)
@@ -49,8 +62,11 @@ def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
                 w = max(nw, rb.left); s = max(ns, rb.bottom)
                 e = min(ne, rb.right); n = min(nn, rb.top)
                 if w >= e or s >= n:
+                    log(f"    [{i}/{len(hrefs)}] {name}: outside bbox  | {prog.tick()}")
                     continue
-                # candidates per AOI part (see common.candidate_tiles), clipped to this raster's extent
+                # candidates per AOI part (see common.candidate_tiles), clipped to this raster's
+                # extent; the list is materialised so the progress lines can say "of how many"
+                todo = []
                 for tx, ty in common.candidate_tiles(grid, bbox, crs, aoi):
                     tw, ts, te, tn = grid.tile_bounds(tx, ty)
                     if te <= w or tw >= e or tn <= s or ts >= n:
@@ -58,14 +74,19 @@ def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
                     if (band, "", tx, ty) in skip_keys:
                         continue
                     wb = common.wgs84_bounds(grid, tx, ty, crs)
-                    if not in_aoi(wb):
-                        continue
+                    if in_aoi(wb):
+                        todo.append((tx, ty, wb))
+                for k, (tx, ty, wb) in enumerate(todo, 1):
                     arr = common.read_tile_window(ds, grid, tx, ty, nd)
-                    if arr is None:
-                        continue
-                    blob = common.encode_geotiff(arr, grid, tx, ty, crs, nd)
-                    if writer.add(band, "", tx, ty, crs, grid.res, tile_px,
-                                  wb, nd, None, source_id, blob):
-                        written += 1
+                    if arr is not None:
+                        blob = common.encode_geotiff(arr, grid, tx, ty, crs, nd)
+                        if writer.add(band, "", tx, ty, crs, grid.res, tile_px,
+                                      wb, nd, None, source_id, blob):
+                            written += 1
+                            asset_written += 1
+                    if k % PROGRESS_EVERY == 0 and k < len(todo):
+                        log(f"      {name}: {k}/{len(todo)} tiles read, {written} stored so far, "
+                            f"elapsed {fmt_duration(time.time() - t0)}")
+            log(f"    [{i}/{len(hrefs)}] {name}: {asset_written} tiles  | {prog.tick()}")
     log(f"    {band}: {written} tiles")
     return written

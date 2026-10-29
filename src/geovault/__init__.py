@@ -6,4 +6,4 @@ GeoTIFF tiles, answer existence queries from a small catalog, and read from any
 local project through geovault.reader or plain DuckDB.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

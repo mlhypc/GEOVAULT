@@ -42,6 +42,9 @@ def main(argv=None):
                    help="scenes fetched concurrently (each scene already reads its bands in parallel); default 3")
     p.add_argument("--keep-offzone", action="store_true",
                    help="allow duplicate storage across UTM zone boundaries")
+    p.add_argument("--flush-mb", type=float, default=256,
+                   help="write buffered tiles to disk once they exceed this many MB (default 256); "
+                        "an interrupted run keeps every flushed part file")
     p.add_argument("--dry-run", action="store_true",
                    help="fetch nothing; report per scene how many tiles are not in the store yet "
                         "(exit 0 = complete, 1 = gaps). Use it to verify coverage after an ingest.")
@@ -132,7 +135,7 @@ def main(argv=None):
             # Static sources have no scene plan to check against; until they do, refuse rather than
             # silently run the real ingest (a 294-tile Turkey fetch once happened under --dry-run).
             ap.error(f"{a.dataset} is static and does not support --dry-run")
-        writer = Writer(a.dataset)
+        writer = Writer(a.dataset, max_buffer_mb=a.flush_mb, log=log.info)
         skip = set()
         for res in src.RES_LIST:
             skip |= writer.existing_keys(res, [""])
@@ -142,7 +145,8 @@ def main(argv=None):
         extra = {"workers": a.workers} if "workers" in inspect.signature(src.ingest).parameters else {}
         total = src.ingest(bbox, writer, bands=a.bands, skip_keys=skip,
                            aoi=aoi, log=log.info, **extra)
-        for f, n in writer.close().items():
+        writer.close()
+        for f, n in writer.written.items():
             log.info(f"  wrote: {f} (+{n} rows)")
         sealed = compact(a.dataset)     # no open parts after a finished run (see the dated path)
         if sealed:
@@ -161,7 +165,7 @@ def main(argv=None):
     if not items:
         return 0
 
-    writer = Writer(a.dataset)
+    writer = Writer(a.dataset, max_buffer_mb=a.flush_mb, log=log.info)
     months = sorted({i.properties["datetime"][:7] for i in items})
     res_list = sorted({r for _, r in
                        (src.BAND_TO_ASSET.values() if hasattr(src, "BAND_TO_ASSET")
@@ -191,9 +195,9 @@ def main(argv=None):
         return 0 if missing == 0 else 1
 
     total = 0
-    written = {}
     failed = []               # (scene_id, error) for scenes whose ingest raised
     FLUSH_EVERY = 10          # scenes per chunk; an interrupted run keeps every finished chunk
+                              # (the Writer also flushes on its own past --flush-mb)
     SCENE_WORKERS = a.workers # scenes fetched concurrently (each scene fans out over its bands)
     from concurrent.futures import ThreadPoolExecutor
 
@@ -215,15 +219,10 @@ def main(argv=None):
         for start in range(0, len(items), FLUSH_EVERY):
             chunk = list(enumerate(items[start:start + FLUSH_EVERY], start + 1))
             total += sum(ex.map(one, chunk))
-            part = writer.close()          # rows -> new part files (auto-compacted past the threshold)
-            for f, n in part.items():
-                written[f] = written.get(f, 0) + n
-            if part:
-                log.info(f"  flushed {sum(part.values())} rows to disk")
+            writer.close()                 # rows -> new part files (auto-compacted past the threshold)
 
-    for f, n in writer.close().items():
-        written[f] = written.get(f, 0) + n
-    for f, n in written.items():
+    writer.close()
+    for f, n in writer.written.items():
         log.info(f"  wrote: {f} (+{n} rows)")
     # Seal: a finished run leaves no open part files behind. Parts are the write-side mechanism
     # (cheap appends, crash-safe chunks); once the run is over each touched month is merged into
