@@ -1,0 +1,7 @@
+# Copernicus Data Space Ecosystem (CDSE) S3 keys, used by the `cgls_ndvi300` adapter.
+# 1. Register (free): https://dataspace.copernicus.eu
+# 2. Create an S3 key pair: https://eodata-s3keysmanager.dataspace.copernicus.eu
+# 3. Copy this file to `cdse_s3` (no extension) in this folder and paste both keys below.
+#    `api/cdse_s3` is git-ignored; only this .example is committed.
+access_key: paste-your-access-key-here
+secret_key: paste-your-secret-key-here
