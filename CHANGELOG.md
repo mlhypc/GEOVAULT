@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 (2026-11-03)
+
+- New source `modis_vi`: MODIS vegetation indices (MOD13Q1 Terra + MYD13Q1 Aqua v061, 16-day
+  composites, 250 m) from Microsoft Planetary Computer. Terra and Aqua are stored as separate
+  bands (ndvi, evi, reliability, doy, quality), raw values with GeoTIFF scale, default bands
+  ndvi + reliability. Planetary Computer has no scenes between 2025-07-12 and 2025-11-01.
+
 ## 0.2.0 (2026-10-29)
 
 - Writer flushes its buffer to a part file on its own once it holds more than `--flush-mb`

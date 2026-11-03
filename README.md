@@ -57,6 +57,7 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 | `soilgrids` | SoilGrids 250 m soil properties (11 props x 6 depths), static | ISRIC VRT/COG | none |
 | `chirps` | CHIRPS 2.0 daily precipitation, 0.05 deg (~5 km), mm/day, 1981 to ~2 days ago | UCSB Climate Hazards Center (gzipped GeoTIFF per day) | none |
 | `modis_lst` | MODIS land surface temperature (MOD11A1 Terra + MYD11A1 Aqua), daily day/night, 1 km, 2000 to today | Microsoft Planetary Computer | none |
+| `modis_vi` | MODIS vegetation indices (MOD13Q1 Terra + MYD13Q1 Aqua), 16-day NDVI/EVI + reliability, 250 m, 2000 to today (PC has no scenes 2025-07-12 to 2025-11-01) | Microsoft Planetary Computer | none |
 | `era5` | ERA5 reanalysis single levels (2 m temperature, dewpoint, precipitation, wind, radiation, ...), hourly, 0.25 deg, 1940 to ~1 week ago | Google ARCO-ERA5 public bucket (Zarr) | none |
 | `era5land` | ERA5-Land reanalysis, hourly, 0.1 deg, land only, 1950 to ~5 days ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
 | `era5land_daily` | ERA5-Land daily mean/min/max of the instantaneous fields (temperature, dewpoint, wind, soil moisture, skin temperature), local time zone, 0.1 deg | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
