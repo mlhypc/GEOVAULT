@@ -144,7 +144,8 @@ def search(bbox, start, end, cloud_max=None, limit=None):
 
 
 def _prelim_keys_in_store(dataset, day: _date) -> set:
-    """(band, date, x, y) of this day's hours stored from ERA5T; a final item must re-fetch those."""
+    """(band, date, crs, x, y) of this day's hours stored from ERA5T; a final item must
+    re-fetch those."""
     from .. import catalog
     import duckdb
     p = catalog.path(dataset)
@@ -152,7 +153,7 @@ def _prelim_keys_in_store(dataset, day: _date) -> set:
         return set()
     con = duckdb.connect()
     rows = con.execute(
-        f"SELECT band, date, x, y FROM read_parquet('{p.as_posix()}') "
+        f"SELECT band, date, '{CRS}', x, y FROM read_parquet('{p.as_posix()}') "
         f"WHERE date LIKE ? AND scene_id = ?", [day.isoformat() + "%", SCENE_PRELIM]).fetchall()
     con.close()
     return set(rows)

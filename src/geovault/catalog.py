@@ -28,15 +28,16 @@ def rebuild(dataset: str) -> int:
         con.execute(
             "COPY (SELECT NULL band, NULL date, NULL x, NULL y, NULL west, NULL south, "
             "NULL east, NULL north, NULL cloud_pct, NULL scene_id, NULL size_bytes, "
-            "NULL file WHERE false) TO '{}' (FORMAT PARQUET)".format(path(dataset).as_posix()))
+            "NULL file, NULL crs WHERE false) TO '{}' (FORMAT PARQUET)"
+            .format(path(dataset).as_posix()))
         con.close()
         return 0
     lst = ", ".join(f"'{f.as_posix()}'" for f in files)
     con.execute(
         f"COPY (SELECT band, date, x, y, west, south, east, north, cloud_pct, "
-        f"scene_id, size_bytes, filename AS file "
+        f"scene_id, size_bytes, filename AS file, crs "
         f"FROM read_parquet([{lst}], filename=true, union_by_name=true) "
-        f"ORDER BY band, date, x, y) "
+        f"ORDER BY band, date, crs, x, y) "
         f"TO '{path(dataset).as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)")
     n = con.execute(
         f"SELECT count(*) FROM read_parquet('{path(dataset).as_posix()}')").fetchone()[0]

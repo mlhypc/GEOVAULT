@@ -3,7 +3,7 @@
 One Parquet file per (dataset, year, month, resolution group); each row is one
 tile with its pixels as a DEFLATE GeoTIFF blob. Ingest appends cheap immutable
 part files; a month is sealed into a single file by compaction. Deduplication is
-on the logical key (band, date, x, y), newest fetched_at wins. Rows are sorted
+on the logical key (band, date, crs, x, y), newest fetched_at wins. Rows are sorted
 (band, date, x, y) so DuckDB row-group statistics prune reads.
 
 Layout:
@@ -77,7 +77,8 @@ class Writer:
         self.log = log                      # callable taking one line, e.g. logger.info
         self.rows = []
         self.buffered_bytes = 0             # blob bytes in self.rows
-        self.seen = {}      # (band, date, x, y) -> (row index or None when flushed, valid_px, scene_id)
+        # (band, date, crs, x, y) -> (row index or None when flushed, valid_px, scene_id)
+        self.seen = {}
         self.written = {}   # part file -> rows, everything this Writer wrote to disk
         self.touched = set()                # (res, month date) groups with a part written by us
         self._last_fetched_at = 0
@@ -93,7 +94,7 @@ class Writer:
         ingests are deterministic. A better tile for a key that was already flushed is
         appended again; compaction keeps the newest fetched_at, which is this one.
         Returns True when the buffer gained a new key."""
-        key = (band, date, x, y)
+        key = (band, date, crs, x, y)
         w, s, e, n = wgs84_bounds
         row = dict(
             band=band, date=date, x=x, y=y, crs=crs, res=float(res), tile_px=tile_px,
@@ -177,7 +178,9 @@ class Writer:
         return written
 
     def existing_keys(self, res: float, months: list) -> set:
-        """(band, date, x, y) already stored for this dataset/res in the given months."""
+        """(band, date, crs, x, y) already stored for this dataset/res in the given months.
+        The CRS is part of the key: UTM tile numbers restart in every zone, so (x, y)
+        alone names different ground in different zones."""
         files = []
         for m in months:
             files += month_files(self.dataset, res, (m + "-01") if m else "")
@@ -186,7 +189,8 @@ class Writer:
         con = duckdb.connect()
         lst = ", ".join(f"'{f.as_posix()}'" for f in files)
         rows = con.execute(
-            f"SELECT band, date, x, y FROM read_parquet([{lst}], union_by_name=true)").fetchall()
+            f"SELECT band, date, crs, x, y "
+            f"FROM read_parquet([{lst}], union_by_name=true)").fetchall()
         con.close()
         return set(rows)
 
@@ -273,7 +277,7 @@ def _compact_month_locked(dataset: str, res: float, date: str, target):
     con.execute(
         f"COPY (SELECT {cols} FROM ("
         f"  SELECT {cols}, row_number() OVER "
-        f"    (PARTITION BY band, date, x, y ORDER BY fetched_at DESC) rn"
+        f"    (PARTITION BY band, date, crs, x, y ORDER BY fetched_at DESC) rn"
         f"  FROM read_parquet([{lst}], union_by_name=true)) WHERE rn = 1 "
         f"ORDER BY band, date, x, y) "
         f"TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 256)")
@@ -306,7 +310,7 @@ def reencode_month(dataset: str, res: float, date: str, workers: int = 8, wait: 
         rows = con.execute(
             f"SELECT {cols} FROM ("
             f"  SELECT {cols}, row_number() OVER "
-            f"    (PARTITION BY band, date, x, y ORDER BY fetched_at DESC) rn"
+            f"    (PARTITION BY band, date, crs, x, y ORDER BY fetched_at DESC) rn"
             f"  FROM read_parquet([{lst}], union_by_name=true)) WHERE rn = 1 "
             f"ORDER BY band, date, x, y").fetchall()
         i_data, i_size = COLS.index("data"), COLS.index("size_bytes")

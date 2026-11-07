@@ -105,7 +105,7 @@ def search(bbox, start, end, cloud_max=None, limit=None):
 
 
 def _prelim_keys_in_store(dataset, day) -> set:
-    """(band, date, x, y) of this day's tiles that are stored from the prelim stream.
+    """(band, date, crs, x, y) of this day's tiles that are stored from the prelim stream.
     A final item must re-fetch those, so they are removed from skip_keys."""
     from .. import catalog
     import duckdb
@@ -114,7 +114,7 @@ def _prelim_keys_in_store(dataset, day) -> set:
         return set()
     con = duckdb.connect()
     rows = con.execute(
-        f"SELECT band, date, x, y FROM read_parquet('{p.as_posix()}') "
+        f"SELECT band, date, '{CRS}', x, y FROM read_parquet('{p.as_posix()}') "
         f"WHERE date = ? AND scene_id = ?", [day.isoformat(), SCENE_PRELIM]).fetchall()
     con.close()
     return set(rows)

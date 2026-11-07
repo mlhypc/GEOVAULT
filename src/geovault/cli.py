@@ -132,8 +132,8 @@ def main(argv=None):
 
     if getattr(src, "STATIC", False):
         if a.dry_run:
-            # Static sources have no scene plan to check against; until they do, refuse rather than
-            # silently run the real ingest (a 294-tile Turkey fetch once happened under --dry-run).
+            # Static sources have no scene plan to check against; refuse rather than fall
+            # through to the real ingest, which would download while the user asked for a check.
             ap.error(f"{a.dataset} is static and does not support --dry-run")
         writer = Writer(a.dataset, max_buffer_mb=a.flush_mb, log=log.info)
         skip = set()

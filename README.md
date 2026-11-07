@@ -26,7 +26,7 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 
 1. **Catalog and store are separate.** "What exists?" is answered by one small
    Parquet per dataset; readers never scan pixel files. (Borrowed from Google
-   Earth's BulkMetadata design, which we reverse-engineered before building this.)
+   Earth's BulkMetadata design.)
 2. **Few big immutable files.** One Parquet per (dataset, month, resolution
    group); each row is a tile, pixels stored as a DEFLATE GeoTIFF blob. Rows are
    sorted (band, date, x, y) so DuckDB row-group statistics prune reads. Float tiles
@@ -54,6 +54,11 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 | `glo30` | Copernicus GLO-30 DEM, 30 m, static | AWS open data COG | none |
 | `glo90` | Copernicus GLO-90 DEM, 90 m, static (same product family as GLO-30, ~1/8 the transfer per cell; for basemap-grade elevation, not per-parcel precision) | AWS open data COG | none |
 | `worldcover` | ESA WorldCover 2021, 10 m land cover, static | AWS open data COG | none |
+| `nasadem` | NASADEM (SRTM 2000 reprocessed), surface model, 30 m, EGM96, static; public domain | Microsoft Planetary Computer | none |
+| `aw3d30` | JAXA ALOS World 3D 30 m v3.2 (PRISM optical stereo 2006-2011), surface model, EGM96, static; JAXA terms (commercial use allowed) | Microsoft Planetary Computer | none |
+| `gedtm30` | GEDTM30 v1.2 global terrain model (bare earth, ML ensemble), 30 m, EGM2008, bands DTM / STD / MASK, static; CC BY 4.0 | OpenGeoHub global COG | none |
+| `fabdem` | FABDEM V1-2 (GLO-30 with forests and buildings removed), bare earth, 30 m, EGM2008, static; **CC BY-NC-SA 4.0, non-commercial only** | University of Bristol (GeoTIFFs read inside 10x10 degree zips) | none |
+| `3dep_1m` | USGS 3DEP 1 m DEM (lidar bare earth), US only, NAD83 / UTM, NAVD88, static; public domain | USGS TNM API + prd-tnm COG | none |
 | `soilgrids` | SoilGrids 250 m soil properties (11 props x 6 depths), static | ISRIC VRT/COG | none |
 | `chirps` | CHIRPS 2.0 daily precipitation, 0.05 deg (~5 km), mm/day, 1981 to ~2 days ago | UCSB Climate Hazards Center (gzipped GeoTIFF per day) | none |
 | `modis_lst` | MODIS land surface temperature (MOD11A1 Terra + MYD11A1 Aqua), daily day/night, 1 km, 2000 to today | Microsoft Planetary Computer | none |
@@ -65,25 +70,6 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 | `era5land` | ERA5-Land reanalysis, hourly, 0.1 deg, land only, 1950 to ~5 days ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
 | `era5land_daily` | ERA5-Land daily mean/min/max of the instantaneous fields (temperature, dewpoint, wind, soil moisture, skin temperature), local time zone, 0.1 deg | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
 | `agera5` | AgERA5 v2 daily agrometeorological indicators (Tmean/max/min, RH at fixed hours, dewpoint, wind, solar, precipitation), 0.1 deg, 1979 to ~1 week ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
-
-### What this vault holds (2026-09-18)
-
-The code covers every dataset above; the local store on this machine currently
-holds (AOI: Turkey bbox 25.6 35.8 44.9 42.2 unless noted):
-
-| Dataset | Stored range | Tiles | On disk |
-|---------|--------------|-------|---------|
-| `s2` | 2018-06-01 to 2026-09-06 (placement parcels AOI) | 20k | 1.7 GB |
-| `s1` | 2018-11-01 to 2026-09-04 (placement parcels AOI) | 15k | 3.0 GB |
-| `landsat` | 2000-01-13 to 2026-08-24 (placement parcels AOI) | 36k | 2.7 GB |
-| `glo30` / `glo90` | static | 593 / 3121 | 96 / 429 MB |
-| `soilgrids` | static, 61 bands | 19k | 857 MB |
-| `chirps` | 2010-01-01 to 2026-09-10 | 49k | 322 MB |
-| `modis_lst` | 2026-01-01 to 2026-08-28 | 72k | 1.1 GB |
-| `agera5` | 2008-01-01 to 2026-08-31, 12 bands | 405k | 7.9 GB |
-| `worldcover`, `era5`, `era5land`, `era5land_daily` | not ingested yet (adapters tested, store empty) | | |
-
-Total 18 GB. `geovault coverage <dataset>` prints the live version of this table.
 
 ### Landsat
 
@@ -199,8 +185,8 @@ credentials in `api/`): the 0.1 deg family (~11 x 9 km over Turkey). ERA5-Land i
 hourly raw reanalysis, land only; AgERA5 is its daily agronomic reduction (v2.0), a
 derived product stored as published like CHIRPS. Second stated deviation from the
 rules: CDS is a request API (it assembles a NetCDF server-side and returns a file), not
-byte-range reads. One request per day per scene (`era5land`: all bands and 24 hours in
-one; `agera5`: one per variable with its statistics, run concurrently), area = the whole
+byte-range reads. `era5land`: one request per day with all bands and 24 hours;
+`agera5`: one request per calendar month and variable, run concurrently; area = the whole
 10 deg tiles the AOI touches, so stored tiles are always complete. Measured: a day of
 Turkey answered in tens of seconds; the service is queued and may take minutes under
 load. Re-running an ingest retries only what is missing, as everywhere.
@@ -208,9 +194,11 @@ load. Re-running an ingest retries only what is missing, as everywhere.
 CDS can also reject a scene outright with `400 ... Number queued requests for this
 dataset is temporarily limited`, when too many jobs are queued for the dataset at once
 (default `--workers 3` scenes in parallel, each already running up to 4 concurrent
-variable requests inside `agera5`, so 12 simultaneous submissions). Not a fixed rule —
-the same range has ingested cleanly before at the default. If you see this error,
-re-run the same command with `--workers 1` to drop the cross-scene concurrency.
+variable requests inside `agera5`, so 12 simultaneous submissions). The limit varies
+with the load on CDS: the same range can ingest cleanly at the default. If you see this
+error, re-run the same command with `--workers 1` to drop the cross-scene concurrency.
+If that is still rejected, run one variable per command (`--workers 1 --bands <one>`)
+in a loop; a month over a 20 x 6 degree area then takes about a minute per variable.
 
 ```bash
 geovault ingest --dataset era5land --bbox 25.6 35.8 44.9 42.2 --start 2026-06-01 --end 2026-06-30
@@ -268,6 +256,35 @@ cells over e.g. Azerbaijan and Armenia (HTTP 404), so parcels there get no DEM
 tiles and the ingest reports them as missing assets, not as an error. GLO-90
 (`glo90`) is the same product family, coarser (3 arc second vs 1), from a
 separate AWS bucket; same missing-cell behaviour.
+
+The other global DEMs follow the same 1-degree pattern; `3dep_1m` is UTM-tiled (see
+below). Each DEM is stored exactly as published (native grid, vertical datum and
+units), so comparing them needs a datum conversion on the reader's side (EGM96 for
+`nasadem` / `aw3d30`, EGM2008 for `glo30` / `gedtm30` / `fabdem`, NAVD88 for
+`3dep_1m` in the conterminous US, other datums in Hawaii, Alaska and the territories):
+
+- Some products ship files that overlap their neighbours (`nasadem`: 3601 px files
+  sharing an edge row; `3dep_1m`: a 6 m buffer). Their adapters pass each file's
+  nominal cell as a footprint and the engine stores only the pixels that file owns.
+- `gedtm30` DTM and STD files carry a GDAL scale tag of 0.1 although the values are
+  already metres; tiles are stored without it.
+- `fabdem` is licensed CC BY-NC-SA 4.0 (non-commercial use only); GEOVAULT fetches it
+  from the publisher on your machine and does not redistribute it. Do not share a
+  store, tiles or derived products containing `fabdem` except under the same licence.
+- Pixel-centre registered files (`glo30`, `glo90`, `nasadem`, `fabdem`) own ground half
+  a pixel past their 1-degree cell, so a bbox just past a degree line opens both files.
+- `3dep_1m` may find several lidar projects over one 10 km cell. Each tile comes from
+  the project with the latest TNM publication date (not the acquisition year) whose
+  tile is complete, else from the one with the most valid pixels; the project is the
+  tile's `scene_id`. Old file names without a UTM zone take the zone from the file.
+  Near a zone line, ground within one tile of the line is stored in both zones, so no
+  strip is left uncovered; the reader picks one. `fabdem` cells are taken from the
+  publisher's tile index, so an open failure is always reported for a re-run.
+
+```bash
+geovault ingest --dataset gedtm30 --bbox -119.50 36.55 -119.30 36.70
+geovault ingest --dataset 3dep_1m --bbox -119.50 36.55 -119.30 36.70
+```
 
 SoilGrids is stored in its native Goode Homolosine projection (no resampling);
 the reader's clip reprojects the polygon, not the pixels. Its bands are
@@ -384,14 +401,12 @@ tiles along AOI borders; the tile is the unit, not the polygon.
 
 ## Consumers
 
-AGRO_DATA_LOCAL (TOPRAQ_AGRODB) reads this vault directly: the parcel analysis
-layer (`/api/ee/*`: GLO-30 elevation, Sentinel-2 indices and composites,
-Sentinel-1 backscatter products, Landsat surface temperature and indices,
-clipped per parcel on demand) and the dated "S2" base layer
-(`/api/basetile/s2-<date>/…`, B4/B3/B2 true colour warped to Web Mercator) both
-go through the catalog and read blobs only from the files it names. Nothing is
-copied out of the vault. Landsat pixels are stored raw; the consumer applies the
-scale/offset carried in each blob (see [Landsat](#landsat)).
+Applications read the vault the same way: look tiles up in the catalog, then read
+blobs only from the files it names (for example a parcel analysis API clipping
+elevation, Sentinel-2 indices or Landsat temperature per parcel on demand, or a map
+server warping dated true-colour tiles to Web Mercator). Nothing is copied out of the
+vault. Landsat pixels are stored raw; the consumer applies the scale/offset carried
+in each blob (see [Landsat](#landsat)).
 
 ## Reading from other projects
 
@@ -437,7 +452,10 @@ data/
 
 Row schema: `band, date, x, y, crs, res, tile_px, west/south/east/north (WGS84),
 nodata, cloud_pct, scene_id, data (GeoTIFF blob), size_bytes, fetched_at`.
-Logical key: `(dataset, band, date, x, y)`. Tiles are keyed to the ground, never
+Logical key: `(dataset, band, date, crs, x, y)`. The CRS is part of the key because
+UTM tile numbers restart in every zone: the same `(x, y)` in zones 35 and 36 is ground
+six degrees apart. The catalog carries the CRS too, and the reader uses it to pick the
+right tile. Tiles are keyed to the ground, never
 to a parcel or project, so overlapping AOIs share tiles and deleting an AOI
 never invalidates data.
 
@@ -482,9 +500,10 @@ on precipitation) and is left as is.
 
 ### UTM zone boundary rule
 
-Ground near a zone boundary appears in scenes of both zones (with different CRS,
-so the dedup key cannot catch it). By default a tile is stored only from the
-scene of its center's canonical zone; `--keep-offzone` disables the rule. The
+Ground near a zone boundary appears in scenes of both zones, with different CRS
+and tile numbers, so the key alone cannot tell they are the same ground. By default
+a tile is stored only from the scene of its center's canonical zone; `--keep-offzone`
+disables the rule. The
 reader's mosaic also prefers the zone of the bbox center.
 
 ## Development
@@ -510,6 +529,11 @@ each provider's terms and license before fetching or publishing anything:
 | Sentinel-1 / Sentinel-2 | Copernicus Sentinel data legal notice (free use with attribution: "Contains modified Copernicus Sentinel data") |
 | Landsat Collection 2 | USGS, public domain; attribution requested: "Landsat imagery courtesy of the U.S. Geological Survey" |
 | Copernicus GLO-30 / GLO-90 DEM | Copernicus DEM license (ESA / Airbus terms) |
+| NASADEM | NASA, public domain |
+| ALOS AW3D30 (v3.2) | JAXA terms: free including commercial use, attribution required |
+| GEDTM30 (OpenGeoHub) | CC BY 4.0, attribution required |
+| FABDEM V1-2 | **CC BY-NC-SA 4.0, non-commercial only**; commercial licence from Fathom |
+| USGS 3DEP 1 m DEM | Public domain; USGS credit requested |
 | ESA WorldCover | CC BY 4.0, attribution required |
 | SoilGrids (ISRIC) | CC BY 4.0, attribution required |
 | CHIRPS 2.0 | Public domain (CHC/UCSB); cite Funk et al. 2015 |

@@ -32,10 +32,10 @@ def tiles_for_bbox(dataset, bbox, band=None, date=None) -> list:
     if date:
         where.append(f"date LIKE '{date}%'")
     con = duckdb.connect()
+    # crs is in catalogs built by 0.5.0 and later; older catalogs yield NULL until rebuilt
     cur = con.execute(
-        f"SELECT band, date, x, y, west, south, east, north, cloud_pct, scene_id, file "
-        f"FROM read_parquet('{p.as_posix()}') WHERE {' AND '.join(where)} "
-        f"ORDER BY band, date, x, y")
+        f"SELECT * FROM read_parquet('{p.as_posix()}', union_by_name=true) "
+        f"WHERE {' AND '.join(where)} ORDER BY band, date, x, y")
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     con.close()
@@ -43,12 +43,17 @@ def tiles_for_bbox(dataset, bbox, band=None, date=None) -> list:
 
 
 def read_tile(row):
-    """One catalog row -> (array, rasterio profile). Opens only the named file."""
+    """One catalog row -> (array, rasterio profile). Opens only the named file.
+    The CRS is part of the tile key: UTM tile numbers restart in every zone, so the
+    same (x, y) can be stored twice in one file, for ground in two zones."""
+    sql = (f"SELECT data FROM read_parquet('{Path(row['file']).as_posix()}', "
+           f"union_by_name=true) WHERE band=? AND date=? AND x=? AND y=?")
+    args = [row["band"], row["date"], row["x"], row["y"]]
+    if row.get("crs") is not None:
+        sql += " AND crs=?"
+        args.append(row["crs"])
     con = duckdb.connect()
-    blob = con.execute(
-        f"SELECT data FROM read_parquet('{Path(row['file']).as_posix()}', union_by_name=true) "
-        f"WHERE band=? AND date=? AND x=? AND y=?",
-        [row["band"], row["date"], row["x"], row["y"]]).fetchone()[0]
+    blob = con.execute(sql, args).fetchone()[0]
     con.close()
     with rasterio.MemoryFile(io.BytesIO(bytes(blob))) as mem:
         with mem.open() as ds:

@@ -171,6 +171,6 @@ def plan_tiles(grid, bbox, crs, band, date, skip_keys, keep_offzone, in_aoi) -> 
     Shared by ingest (what to read) and --dry-run (what would be read)."""
     nw, ns, ne, nn = bbox_to_crs(bbox, crs)
     return [(tx, ty) for tx, ty in grid.tiles_for_bounds(nw, ns, ne, nn)
-            if (band, date, tx, ty) not in skip_keys
+            if (band, date, crs, tx, ty) not in skip_keys
             and (keep_offzone or tile_is_canonical(grid, tx, ty, crs))
             and in_aoi(wgs84_bounds(grid, tx, ty, crs))]

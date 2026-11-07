@@ -119,7 +119,7 @@ def _prelim_keys_in_store(dataset, day: _date) -> set:
         return set()
     con = duckdb.connect()
     rows = con.execute(
-        f"SELECT band, date, x, y FROM read_parquet('{p.as_posix()}') "
+        f"SELECT band, date, '{CRS}', x, y FROM read_parquet('{p.as_posix()}') "
         f"WHERE date LIKE ? AND scene_id = ?", [day.isoformat() + "%", SCENE_PRELIM]).fetchall()
     con.close()
     return set(rows)

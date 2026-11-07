@@ -5,8 +5,6 @@ One COG per 3x3 degree macrotile, anonymous access. Values are class codes
 60 bare, 70 snow/ice, 80 water, 90 wetland, 95 mangroves, 100 moss/lichen).
 """
 
-import math
-
 from . import static_cog
 
 STATIC = True
@@ -20,21 +18,9 @@ _URL = ("https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/"
 
 
 def _cells(bbox, aoi=None):
-    """3x3 degree COG cells covering bbox; with an AOI only the cells the polygon touches
-    (a scattered set of parcels has a huge bbox, every yielded cell costs a remote open)."""
-    w, s, e, n = bbox
-    if aoi is not None:
-        from shapely.geometry import box
-        from shapely.prepared import prep
-        hit = prep(aoi).intersects
-    lat0 = math.floor(s / 3) * 3
-    lon0 = math.floor(w / 3) * 3
-    for lat in range(lat0, math.ceil(n), 3):
-        for lon in range(lon0, math.ceil(e), 3):
-            if aoi is not None and not hit(box(lon, lat, lon + 3, lat + 3)):
-                continue
-            yield _URL.format(ns="N" if lat >= 0 else "S", lat=abs(lat),
-                              ew="E" if lon >= 0 else "W", lon=abs(lon))
+    for lat, lon in static_cog.degree_cells(bbox, aoi, step=3, pad=0.0):
+        yield _URL.format(ns="N" if lat >= 0 else "S", lat=abs(lat),
+                          ew="E" if lon >= 0 else "W", lon=abs(lon))
 
 
 def ingest(bbox, writer, bands=None, skip_keys=None, aoi=None, log=print) -> int:
