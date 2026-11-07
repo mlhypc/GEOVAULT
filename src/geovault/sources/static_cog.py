@@ -11,6 +11,7 @@ import math
 import os
 import time
 
+import numpy as np
 import rasterio
 from rasterio.transform import Affine, array_bounds
 
@@ -125,9 +126,12 @@ def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
                 # candidates per AOI part (see common.candidate_tiles), clipped to this raster's
                 # extent; the list is materialised so the progress lines can say "of how many"
                 todo = []
+                # a tile that only touches the owned extent within floating-point noise belongs
+                # to the neighbouring file: taking it here would store a near-empty sliver
+                eps = grid.res * 0.01
                 for tx, ty in common.candidate_tiles(grid, bbox, crs, aoi):
                     tw, ts, te, tn = grid.tile_bounds(tx, ty)
-                    if te <= w or tw >= e or tn <= s or ts >= n:
+                    if te <= w + eps or tw >= e - eps or tn <= s + eps or ts >= n - eps:
                         continue
                     if (band, "", crs, tx, ty) in skip_keys:
                         continue
@@ -138,8 +142,10 @@ def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
                     arr = common.read_tile_window(ds, grid, tx, ty, nd)
                     if arr is not None:
                         blob = common.encode_geotiff(arr, grid, tx, ty, crs, nd)
+                        # valid_px lets the fuller tile win if two files ever yield the same key
+                        valid = int(np.count_nonzero(arr != nd))
                         if writer.add(band, "", tx, ty, crs, grid.res, tile_px,
-                                      wb, nd, None, source_id, blob):
+                                      wb, nd, None, source_id, blob, valid):
                             written += 1
                             asset_written += 1
                     if k % PROGRESS_EVERY == 0 and k < len(todo):

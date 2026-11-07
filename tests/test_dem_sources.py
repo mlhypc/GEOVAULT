@@ -116,3 +116,38 @@ def test_pixel_centred_cells_include_the_half_pixel_strip():
     # which owns ground up to half a pixel north of 37 N
     cells = list(degree_cells((-119.5, 37.00002, -119.49, 37.01), pad=PX / 2))
     assert (36, -120) in cells and (37, -120) in cells
+
+
+def test_usgs_cell_edge_stores_full_tiles_only(tmp_path, monkeypatch):
+    """Two USGS-like cells with a 6 m buffer and a float-noisy origin: the tile at the shared
+    edge must come whole from the cell that owns it, not as a 6-column sliver of the other."""
+    import duckdb
+    import rasterio
+    from pyproj import Transformer
+    from rasterio.io import MemoryFile
+    from geovault import store
+    from geovault.aoi import tile_filter
+    monkeypatch.setattr(store, "STORE", tmp_path / "store")
+    nd = dem_3dep_1m.NODATA
+    lon, lat = Transformer.from_crs("EPSG:32611", "EPSG:4326", always_xy=True).transform(
+        [280000.0, 300000.0], [4050000.0, 4060000.0])
+    bbox = (lon[0] - 0.01, lat[0] - 0.01, lon[1] + 0.01, lat[1] + 0.01)
+    w = store.Writer("edge", max_buffer_mb=1000)
+    for x, value in ((28, 100.0), (29, 101.0)):
+        tf = Affine(1.0, 0, x * 10000 - 6.0003, 0, -1.0, 4060006.0001)
+        with MemoryFile() as mem:
+            with mem.open(driver="GTiff", width=10012, height=10012, count=1, dtype="float32",
+                          crs="EPSG:26911", transform=tf, nodata=nd) as ds:
+                ds.write(np.full((10012, 10012), value, dtype=np.float32), 1)
+            with mem.open() as ds:
+                dem_3dep_1m._cell_tiles([(ds, f"P{x}")], 11, dem_3dep_1m.footprint(x, 406),
+                                        bbox, None, tile_filter(None), set(), w)
+    w.close()
+    rows = duckdb.sql(f"SELECT x, data FROM read_parquet('{(tmp_path / 'store').as_posix()}"
+                      f"/dataset=edge/static/*.parquet') ORDER BY x, y").fetchall()
+    assert len(rows) == 2 * 20 * 20
+    for x, blob in rows:
+        with MemoryFile(bytes(blob)) as m, m.open() as ds:
+            a = ds.read(1)
+        assert (a != nd).all(), f"tile x={x} is not complete"
+        assert a[0, 0] == (100.0 if x < 580 else 101.0)

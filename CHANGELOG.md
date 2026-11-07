@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1 (2026-11-07)
+
+- Fix `3dep_1m`: a 10 km cell could also take the
+  neighbouring cell's first tile, which a float offset of a fraction of a millimetre made look
+  inside it; it stored a 6-column sliver from its buffer, and the neighbour's full tile was then
+  dropped as a duplicate key. Stores built with 0.5.0 can lack 500 m strips along cell edges:
+  delete the `3dep_1m` dataset and ingest again.
+- Static engine: tiles touching an asset's extent only within floating-point noise are left to
+  the neighbouring asset, and tiles carry their valid pixel count so the fuller one wins a key.
+
 ## 0.5.0 (2026-11-07)
 
 - Five static DEM sources: `nasadem` and `aw3d30` (Planetary Computer), `gedtm30`

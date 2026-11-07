@@ -187,7 +187,8 @@ def _cell_tiles(dss, zone, fp, bbox, aoi, in_aoi, skip_keys, writer) -> int:
     if w >= e or s >= n:
         return 0
     stored = 0
-    for tx, ty in grid.tiles_for_bounds(w, s, e, n):
+    eps = grid.res * 0.01      # tiles touching the cell edge only by float noise are the neighbour's
+    for tx, ty in grid.tiles_for_bounds(w + eps, s + eps, e - eps, n - eps):
         if ("DEM", "", crs, tx, ty) in skip_keys:
             continue
         wb = common.wgs84_bounds(grid, tx, ty, crs)
@@ -198,8 +199,9 @@ def _cell_tiles(dss, zone, fp, bbox, aoi, in_aoi, skip_keys, writer) -> int:
         if i is None:
             continue
         blob = common.encode_geotiff(arr, grid, tx, ty, crs, NODATA)
+        valid = int(np.count_nonzero(arr != NODATA))
         if writer.add("DEM", "", tx, ty, crs, grid.res, TILE_PX, wb, NODATA, None,
-                      f"usgs-3dep-1m:{dss[i][1]}", blob):
+                      f"usgs-3dep-1m:{dss[i][1]}", blob, valid):
             stored += 1
     return stored
 
