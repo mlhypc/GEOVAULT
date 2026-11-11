@@ -105,6 +105,8 @@ def test_reader_picks_the_tile_of_the_right_zone(tmp_store, tmp_path, monkeypatc
     from geovault.grid import Grid
     from geovault.sources.common import encode_geotiff
     monkeypatch.setattr(catalog, "CATALOG", tmp_path / "catalog")
+    # catalog binds STORE when it is first imported, which can be before this test runs
+    monkeypatch.setattr(catalog, "STORE", tmp_store)
     w = Writer("t", max_buffer_mb=1000)
     for crs, value in (("EPSG:32635", 35), ("EPSG:32636", 36)):
         g = Grid(crs, 10.0, 4)

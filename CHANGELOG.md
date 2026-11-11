@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.0 (2026-11-11)
+
+- Two fire sources from Planetary Computer, no account: `modis_fire` (MOD14A1 + MYD14A1 daily
+  thermal anomalies: fire mask, maximum fire radiative power, QA and sample, 1 km, Terra and
+  Aqua as separate bands; the 8-day files are split into one tile per day, and a file that
+  holds fewer days after a satellite outage is dated from its `Dates` tag) and `modis_burned`
+  (MCD64A1 monthly burned area: day of burn, its uncertainty, QA and the detection window,
+  500 m).
+- `sources/modis_sinu.py`: where a MODIS scene sits on the sinusoidal grid, which store tiles
+  it holds and each tile's pixel offset, so an adapter can plan a scene offline and read each
+  asset once. Used by the two new sources; searches keep only the newest production of a
+  reprocessed scene.
+- CLI: the skip set of an ingest now covers every month between a scene's `start_datetime`
+  and `end_datetime`, not only the month it starts in. A file holding several days that
+  crosses a month end was otherwise fetched again on every re-run, and `--dry-run` reported
+  its last days as missing. Sources whose scenes have no interval are unaffected; the others
+  only load a larger skip set.
+- `tests/test_fire_grids.py` covers the scene math, the block read, daily layers, band
+  routing, the months of a scene and an ingest of one scene end to end.
+
 ## 0.5.1 (2026-11-07)
 
 - Fix `3dep_1m`: a 10 km cell could also take the

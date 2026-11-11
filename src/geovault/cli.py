@@ -20,6 +20,22 @@ from .store import Writer, compact, reencode_month
 from . import store as _store
 
 
+def scene_months(item) -> list:
+    """Months (YYYY-MM) a scene can write tiles to: every month from its start_datetime to
+    its end_datetime, or the month of its datetime when it has no interval. A file that
+    holds several days can cross a month end; the skip set must cover both months, or the
+    days in the second one are fetched again on every re-run."""
+    props = item.properties
+    first = (props.get("start_datetime") or props["datetime"])[:7]
+    last = (props.get("end_datetime") or props["datetime"])[:7]
+    year, month = int(first[:4]), int(first[5:7])
+    months = []
+    while f"{year:04d}-{month:02d}" <= last:
+        months.append(f"{year:04d}-{month:02d}")
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return months or [props["datetime"][:7]]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="geovault")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -166,7 +182,10 @@ def main(argv=None):
         return 0
 
     writer = Writer(a.dataset, max_buffer_mb=a.flush_mb, log=log.info)
-    months = sorted({i.properties["datetime"][:7] for i in items})
+    months = set()
+    for item in items:
+        months.update(scene_months(item))
+    months = sorted(months)
     res_list = sorted({r for _, r in
                        (src.BAND_TO_ASSET.values() if hasattr(src, "BAND_TO_ASSET")
                         else [(None, src.RES)])})

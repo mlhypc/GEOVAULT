@@ -66,6 +66,8 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 | `modis_vi_1km` | the same MOD13Q1 / MYD13Q1 composites read from the COGs' 4x overview (926 m, nodata-aware mean of the 250 m pixels) + `good` = share of good/marginal 250 m pixels per km; same tile footprint and numbering as `modis_vi`, about 9x less download | Microsoft Planetary Computer | none |
 | `s3_syn_v10` | Sentinel-3 SYNERGY V10 10-day NDVI (OLCI + SLSTR), 1/112 deg (~1 km), S3A + S3B as separate bands, gapless Oct 2019 to today; HDF5 chunk reads of the EUROPE window | Microsoft Planetary Computer | none |
 | `cgls_ndvi300` | Copernicus Global Land NDVI 300 m 10-daily V3 (OLCI), 1/336 deg, bands ndvi / unc / nobs / qflag, Oct 2019 to today; global COGs range-read from the CDSE object store | Copernicus Data Space (STAC anonymous, data needs S3 keys) | free CDSE account + S3 key pair (`api/cdse_s3`) |
+| `modis_fire` | MODIS thermal anomalies and fire (MOD14A1 Terra + MYD14A1 Aqua), daily fire mask, maximum fire radiative power, QA, 1 km, 2000 to today | Microsoft Planetary Computer | none |
+| `modis_burned` | MODIS burned area (MCD64A1, Terra + Aqua combined), monthly, day of burn + uncertainty + QA, 500 m, Nov 2000 to today | Microsoft Planetary Computer | none |
 | `era5` | ERA5 reanalysis single levels (2 m temperature, dewpoint, precipitation, wind, radiation, ...), hourly, 0.25 deg, 1940 to ~1 week ago | Google ARCO-ERA5 public bucket (Zarr) | none |
 | `era5land` | ERA5-Land reanalysis, hourly, 0.1 deg, land only, 1950 to ~5 days ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
 | `era5land_daily` | ERA5-Land daily mean/min/max of the instantaneous fields (temperature, dewpoint, wind, soil moisture, skin temperature), local time zone, 0.1 deg | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
@@ -101,6 +103,69 @@ A per-scene anchor would have broken the dedup key across scenes.
 Latency: Planetary Computer publishes a Landsat scene about a week after
 acquisition (measured: acquired 2026-08-24, catalogued 2026-08-31). Sentinel-2
 on earth-search is same-day (median 5 h), Sentinel-1 RTC under a day.
+
+### Fire layers (MODIS active fire, burned area)
+
+Two products answer different questions and are stored as two datasets: `modis_fire` says
+where a fire was seen burning on a given day, `modis_burned` says which ground burned and
+on which day. Neither needs an account.
+
+```bash
+geovault ingest --dataset modis_fire   --bbox 25.6 35.8 44.9 42.2 --start 2026-07-01 --end 2026-08-31
+geovault ingest --dataset modis_burned --bbox 25.6 35.8 44.9 42.2 --start 2026-01-01 --end 2026-08-31
+```
+
+**`modis_fire`** (MOD14A1 + MYD14A1): the product is daily but published in 8-day files, each
+asset a raster with one band per day (fewer than 8 after a satellite outage; the file's
+`Dates` tag names them). Every day becomes its own tile, dated with that day, so `date`
+works as in any daily dataset. A file is always stored whole: a date
+range that cuts an 8-day file stores all of that file's days. The last file of a year runs
+into January, where the next year's first file starts again on 1 January with the same
+pixels; one tile per day is kept. Terra (~10:30 / 22:30 local) and Aqua (~13:30 / 01:30)
+are separate bands:
+
+```
+terra_fire_mask  terra_max_frp  terra_qa  terra_sample
+aqua_fire_mask   aqua_max_frp   aqua_qa   aqua_sample
+```
+
+`fire_mask` is the uint8 class of the product: 0-2 not processed, 3 water, 4 cloud, 5 land
+without fire, 6 unknown, 7 / 8 / 9 fire of low / nominal / high confidence. `max_frp` is
+int32 with `MW = DN * 0.1` written as GeoTIFF scale and 0 where there is no fire; the 0 is
+stored as a value, not as nodata, so a series shows "no fire" and not a gap. A tile-day
+is stored when its fire mask holds at least one processed pixel, and then with every band,
+so an all-zero `max_frp` tile means "observed, no fire"; a tile-day that was not processed
+at all is not stored and `--dry-run` keeps reporting it. `cloud_pct` of a `fire_mask` tile
+is its share of pixels without a fire observation (cloud, unknown or not processed). The
+grid is the one of `modis_lst` (240 px tiles of 222 km, same numbering), so the two stack
+pixel for pixel. The daily mask is a 1 km summary of the day's overpasses: small, short or
+cloud-covered fires are missed.
+
+**`modis_burned`** (MCD64A1): one file per month, dated with the first day of the month.
+Bands `burn_date` (int16 day of the year, 0 unburned, -1 unmapped, -2 water),
+`uncertainty` (days), `qa`, `first_day` and `last_day` (the window in which a burn could be
+detected). A tile is stored unless its `burn_date` is entirely unmapped; `cloud_pct` of a
+`burn_date` tile is the share of its pixels left unmapped. 463 m pixels, 240 px tiles
+of 111 km. The product maps the mark a fire leaves in surface reflectance, so it finds
+fires that burned an area, not every ignition, and under-detects small and patchy burns
+such as many cropland fires. Months appear two to three months late. The producer can
+revise a month afterwards; a month already in the store is skipped on re-runs, so a
+revision is not picked up.
+
+The Planetary Computer catalogue of both products has gaps (checked 2026-11-11): no
+`modis_fire` file between 4 July and 24 November 2025 and a few single 8-day files absent
+in most years; `modis_burned` lacks September 2023, July 2024, May 2025 and August to
+October 2025. A search over a gap returns no scenes, so neither the ingest nor `--dry-run`
+can report it; compare `geovault coverage` with the dates you expect.
+
+```python
+series("modis_fire", lon, lat, "aqua_fire_mask", date="2026-07")   # class per day
+series("modis_burned", lon, lat, "burn_date", date="2026")         # day of year, 0 = unburned
+```
+
+Both adapters read each asset of a scene once and cut the tiles locally. One example run
+over a 20 x 6 degree area (six MODIS scenes) took about two minutes and 16 MB per month
+for `modis_fire`, and about seven seconds and 5 MB per month for `modis_burned`.
 
 ### Meteorology layers (CHIRPS, MODIS LST)
 
@@ -538,6 +603,7 @@ each provider's terms and license before fetching or publishing anything:
 | SoilGrids (ISRIC) | CC BY 4.0, attribution required |
 | CHIRPS 2.0 | Public domain (CHC/UCSB); cite Funk et al. 2015 |
 | MODIS MOD11A1/MYD11A1 | NASA LP DAAC, free; cite Wan et al., attribution requested |
+| MODIS MOD14A1/MYD14A1, MCD64A1 | NASA LP DAAC, free; cite Giglio et al., attribution requested |
 | ERA5 (ARCO-ERA5 mirror) | Copernicus Climate Change Service (C3S) licence: free use with attribution ("Generated using Copernicus Climate Change Service information"); ARCO mirror by Google Research |
 | ERA5-Land, AgERA5 (CDS) | C3S licence as above, accepted once per dataset on the CDS website; your account, your requests |
 | AWS Open Data buckets | Each dataset's own terms apply, see the registry entry |

@@ -6,6 +6,7 @@ from . import (
     dem_glo30, dem_glo90, dem_nasadem, dem_aw3d30, dem_gedtm30, dem_fabdem, dem_3dep_1m,
     worldcover, soilgrids,
     chirps, modis_lst, modis_vi, modis_vi_1km, s3_syn_v10, cgls_ndvi300,
+    modis_fire, modis_burned,
     era5, era5land, era5land_daily, agera5,
 )
 
@@ -28,6 +29,8 @@ REGISTRY = {
     "modis_vi_1km": modis_vi_1km,
     "s3_syn_v10": s3_syn_v10,
     "cgls_ndvi300": cgls_ndvi300,
+    "modis_fire": modis_fire,
+    "modis_burned": modis_burned,
     "era5": era5,
     "era5land": era5land,
     "era5land_daily": era5land_daily,
