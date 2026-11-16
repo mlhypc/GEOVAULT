@@ -20,8 +20,9 @@ from . import catalog
 
 
 def tiles_for_bbox(dataset, bbox, band=None, date=None) -> list:
-    """Catalog rows intersecting a WGS84 bbox. date: None | 'YYYY' | 'YYYY-MM' |
-    'YYYY-MM-DD'. Returns a list of dict rows (no pixels)."""
+    """Catalog rows intersecting a WGS84 bbox. date: None or any prefix of the stored date
+    strings ('YYYY', 'YYYY-MM', 'YYYY-MM-DD', 'YYYY-MM-DDTHH', ...). Returns a list of dict
+    rows (no pixels)."""
     p = catalog.path(dataset)
     if not p.exists():
         return []
@@ -52,12 +53,9 @@ def read_tile(row):
     if row.get("crs") is not None:
         sql += " AND crs=?"
         args.append(row["crs"])
-    con = duckdb.connect()
-    blob = con.execute(sql, args).fetchone()[0]
-    con.close()
-    with rasterio.MemoryFile(io.BytesIO(bytes(blob))) as mem:
-        with mem.open() as ds:
-            return ds.read(1), ds.profile
+    with duckdb.connect() as con:
+        blob = con.execute(sql, args).fetchone()[0]
+    return _decode(blob)
 
 
 def mosaic(dataset, bbox, band, date):
@@ -104,21 +102,67 @@ def mosaic(dataset, bbox, band, date):
     return out, Affine(res, 0, x0, 0, -res, y1), crs
 
 
+def _blobs_by_row(rows):
+    """Yield (row index, pixel blob) for many catalog rows, one query per month file instead
+    of one per row. Hourly and sub-hourly layers hold thousands of dates per month; a query
+    per date cost about 20 ms each, mostly connection and file-open overhead. Blobs are
+    yielded file by file, so memory holds one batch at a time, not the whole series.
+
+    A row the catalog names but its file no longer holds raises, as read_tile does: the
+    catalog is stale and must be rebuilt. Catalogs built before 0.5.0 have no crs column;
+    their rows match a stored tile on (band, date, x, y), and when one file holds the same
+    tile numbers in two UTM zones each catalog row takes a different stored tile."""
+    by_file = {}
+    for i, r in enumerate(rows):
+        by_file.setdefault(r["file"], []).append(i)
+    with duckdb.connect() as con:
+        for f, idx in by_file.items():
+            want = {}
+            for i in idx:
+                r = rows[i]
+                want.setdefault((r["band"], r["date"], r["x"], r["y"], r.get("crs")), []).append(i)
+            sub = [rows[i] for i in idx]
+            dates = [r["date"] for r in sub]
+            cur = con.execute(
+                f"SELECT band, date, x, y, crs, data FROM read_parquet('{Path(f).as_posix()}', "
+                f"union_by_name=true) WHERE band IN (SELECT unnest(?)) AND date BETWEEN ? AND ? "
+                f"AND x IN (SELECT unnest(?)) AND y IN (SELECT unnest(?))",
+                [sorted({r["band"] for r in sub}), min(dates), max(dates),
+                 sorted({r["x"] for r in sub}), sorted({r["y"] for r in sub})])
+            while batch := cur.fetchmany(256):
+                for band, d, x, y, crs, data in batch:
+                    hits = want.get((band, d, x, y, crs)) or want.get((band, d, x, y, None))
+                    if hits:
+                        yield hits.pop(), data
+            left = [rows[i] for v in want.values() for i in v]
+            if left:
+                r = left[0]
+                raise RuntimeError(f"{len(left)} catalog rows not found in {f} (e.g. band {r['band']} "
+                                   f"date {r['date']} x {r['x']} y {r['y']}): rebuild the catalog")
+
+
+def _decode(blob):
+    with rasterio.MemoryFile(io.BytesIO(bytes(blob))) as mem:
+        with mem.open() as ds:
+            return ds.read(1), ds.profile
+
+
 def series(dataset, lon, lat, band, date=None):
     """Pixel time series at a WGS84 point.
 
-    For each stored date, opens only the tile containing the point and extracts
-    the single pixel value. Returns a list of dicts:
-    {date, value, cloud_pct, scene_id}, oldest first, nodata pixels skipped.
-    date: None | 'YYYY' | 'YYYY-MM' to restrict the range."""
+    For each stored date, reads only the tile containing the point and extracts
+    the single pixel value; the blobs come from one query per month file. Returns a
+    list of dicts: {date, value, cloud_pct, scene_id}, oldest first, nodata pixels
+    skipped. date: None | 'YYYY' | 'YYYY-MM' | any prefix of the stored date strings."""
     from pyproj import Transformer
     eps = 1e-9
     rows = tiles_for_bbox(dataset, (lon - eps, lat - eps, lon + eps, lat + eps),
                           band=band, date=date)
     out = []
     tr_cache = {}
-    for r in rows:
-        arr, prof = read_tile(r)
+    for i, blob in _blobs_by_row(rows):
+        r = rows[i]
+        arr, prof = _decode(blob)
         crs = str(prof["crs"])
         if crs not in tr_cache:
             tr_cache[crs] = Transformer.from_crs("EPSG:4326", crs, always_xy=True)

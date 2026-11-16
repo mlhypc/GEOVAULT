@@ -1,5 +1,5 @@
 """Source adapters. Adding a dataset = one module (search + ingest_scene) plus
-one REGISTRY line; the engine (grid/store/catalog/reader) never changes."""
+one REGISTRY line; the engine (grid/store/catalog/reader) rarely needs to change."""
 
 from . import (
     s2_earthsearch, s1_pc, landsat,
@@ -8,6 +8,7 @@ from . import (
     chirps, modis_lst, modis_vi, modis_vi_1km, s3_syn_v10, cgls_ndvi300,
     modis_fire, modis_burned,
     era5, era5land, era5land_daily, agera5,
+    pardig_nrt, pardig_lr,
 )
 
 REGISTRY = {
@@ -35,4 +36,6 @@ REGISTRY = {
     "era5land": era5land,
     "era5land_daily": era5land_daily,
     "agera5": agera5,
+    "pardig_nrt": pardig_nrt,
+    "pardig_lr": pardig_lr,
 }

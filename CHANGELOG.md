@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.0 (2026-11-16)
+
+- Two precipitation sources from Google's public WeatherNext bucket, no account (extra
+  `pardig`: zarr, gcsfs, numcodecs): `pardig_nrt` (PARDIG-NRT, 2016 to a few hours ago) and
+  `pardig_lr` (PARDIG-LR, 1999-2023), both a 15-minute instantaneous rate on a 0.1 deg grid,
+  stored raw in m/h, one tile per step with `date` = `YYYY-MM-DDTHH:MM`. Archives are read
+  from the publisher's time-series chunking through a disk cache, so each object is
+  downloaded once and reused by every year scene and later run; the NRT live stream is read
+  step by step, finished steps only. Segment names are discovered from the bucket listing,
+  and the Zarr encoding, grid and time axis are checked before anything is decoded.
+- `encode_geotiff` / `encode_blob` take an optional `predictor` that pins the TIFF predictor
+  and skips the trial encoding; existing sources keep the automatic choice.
+- `reader.series` fetches the blobs with one query per month file instead of one per date,
+  file by file, so a long series no longer pays a connection per date (measured on a
+  15-minute layer: about 0.7 ms per date instead of 11 ms; 3-14 times faster on whole
+  histories of the other datasets, same values). On catalogs built before 0.5.0 (no crs
+  column) a file holding the same tile numbers in two UTM zones now yields each zone once,
+  where it used to return the first zone twice. A catalog row its file no longer holds
+  still raises, now with a message that says to rebuild the catalog. `date` accepts any
+  prefix of the stored date strings.
+- Tests: `tests/test_pardig.py` (lattice, north-up orientation, chunk assembly across time
+  chunks and the north pole, time axes, search across archive and live segments, the cache,
+  an ingest end to end against a fake bucket, the pinned predictor) and
+  `tests/test_reader_series.py` (two zones, catalogs without crs, stale catalogs).
+
 ## 0.6.0 (2026-11-11)
 
 - Two fire sources from Planetary Computer, no account: `modis_fire` (MOD14A1 + MYD14A1 daily

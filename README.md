@@ -72,6 +72,8 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
 | `era5land` | ERA5-Land reanalysis, hourly, 0.1 deg, land only, 1950 to ~5 days ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
 | `era5land_daily` | ERA5-Land daily mean/min/max of the instantaneous fields (temperature, dewpoint, wind, soil moisture, skin temperature), local time zone, 0.1 deg | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
 | `agera5` | AgERA5 v2 daily agrometeorological indicators (Tmean/max/min, RH at fixed hours, dewpoint, wind, solar, precipitation), 0.1 deg, 1979 to ~1 week ago | Copernicus Climate Data Store (request API, NetCDF) | free CDS account |
+| `pardig_nrt` | PARDIG-NRT precipitation rate (Google WeatherNext, machine-learning estimate trained on GPM CORRA), 15-minute, 0.1 deg, 2016 to a few hours ago (published in 6-hourly batches); experimental | Google Cloud public bucket `gs://pardig_1` (Zarr v3) | none |
+| `pardig_lr` | PARDIG-LR precipitation rate, the long-record variant (inputs ERA5, GridSat-B1, passive microwave), 15-minute, 0.1 deg, 1999-2023, static archive; experimental | Google Cloud public bucket `gs://pardig_1` (Zarr v3) | none |
 
 ### Landsat
 
@@ -167,12 +169,13 @@ Both adapters read each asset of a scene once and cut the tiles locally. One exa
 over a 20 x 6 degree area (six MODIS scenes) took about two minutes and 16 MB per month
 for `modis_fire`, and about seven seconds and 5 MB per month for `modis_burned`.
 
-### Meteorology layers (CHIRPS, MODIS LST)
+### Meteorology layers (CHIRPS, MODIS LST, ERA5 family, PARDIG)
 
-The vault's rules (no account, no remote compute, native grid, lossless) leave
-few meteorology sources standing: reanalyses (ERA5, AgERA5) live behind CDS
-accounts or Zarr stores, IMERG behind Earthdata login. Two daily products fit
-and are spatially honest at their own resolution:
+The vault's rules (no account, no remote compute, native grid, lossless) fit the
+daily satellite products directly (CHIRPS, MODIS LST). The others come with stated
+deviations: ERA5 and PARDIG are Zarr stores, not COGs; the ERA5-Land family is a
+request API behind a free account. IMERG stays out behind Earthdata login. The two
+plain daily products first:
 
 ```bash
 geovault ingest --dataset chirps    --bbox 25.6 35.8 44.9 42.2 --start 2026-01-01 --end 2026-09-14
@@ -298,6 +301,67 @@ hours), `d2m_mean` (K), `vp_mean` (hPa), `ws10_mean` (m/s), `tcc_mean`, `tp` (mm
 `ssr` (J m-2 day-1), `sd`. Grid note: the CDS area subsetter drops the northern and western
 edge rows for this dataset, so the request is padded one cell on those sides.
 
+**`pardig_nrt` and `pardig_lr`** (optional extra: `pip install -e .[pardig]`): PARDIG, the
+precipitation product of Google's WeatherNext, a machine-learning estimate of the
+instantaneous surface precipitation rate trained on the GPM combined radar-radiometer product
+(CORRA), every 15 minutes on a 0.1 deg grid. Two variants, kept as two datasets because their
+inputs differ: `pardig_nrt` (ECMWF HRES analysis + SatWeave geostationary mosaic, 2016 to a
+few hours ago; the publisher adds steps in 6-hourly batches, 2-8 hours behind real time) and
+`pardig_lr` (ERA5, GridSat-B1 and passive microwave sounders, 1999-2023, a static archive).
+The publisher recommends NRT for anything from 2016 on; if you splice LR onto NRT, compare
+them over 2016-2023 first, since the change of inputs can shift the record. Both are marked
+experimental: rates are capped at 75 mm/h, estimates poleward of about 67 deg rely on
+unconstrained extrapolation, and light snowfall, drizzle and winter orographic precipitation
+are underestimated. The method paper (arXiv:2611.13941) adds that LR ends with its microwave
+sounder record (appendix A.1) and that the sparser satellite record before 2008 shifts the
+LR distribution.
+
+```bash
+geovault ingest --dataset pardig_nrt --bbox 25.6 35.8 44.9 42.2 --start 2025-01-01 --end 2025-12-31
+geovault ingest --dataset pardig_lr  --bbox 25.6 35.8 44.9 42.2 --start 2023-01-01 --end 2023-12-31
+```
+
+Stated deviation, as for `era5`: the source is Zarr, not COG, and whole objects are
+downloaded rather than byte ranges. The bucket holds each archive twice, chunked as maps (4
+steps x the globe) and as time series (every step x 5 x 5 pixels). The adapter reads the
+time-series copy: a 5 deg tile is 100 chunk objects (10 x 10) for the whole record instead of
+a global chunk per hour. Because each object holds every step of the archive, even a one-day
+archive request downloads the full-record objects of every tile it touches (Turkey, 8 tiles:
+1.3 GB for NRT 2016-2025, measured; about 3 GB for LR 1999-2023, estimated). They go to a disk cache,
+`<GEOVAULT_DATA>/cache/<dataset>/<archive folder>/` (e.g. `cache/pardig_nrt/2016_to_2025/`),
+and every later year scene and run reads them from there. The cache is emptied when the
+archive's `zarr.json` changes, is not removed after a run (it costs about as much disk as
+the stored tiles) and can be deleted whenever no ingest is running.
+
+The live stream after the NRT archive is one folder per step holding one global chunk (~1.1
+MB). A step is read only once its folder holds a `success` object (seen in every finished
+step folder; not documented by the publisher); unfinished steps are picked up by the next
+run, and `--dry-run` reports them as missing until then. Segment names (`2016_to_2025`,
+`2026_to_present`, ...) are discovered by listing the bucket at search time; the folder
+layout, band and grid are fixed and checked before anything is decoded. A scene is one
+calendar year of an archive or one day of the live stream. Do not run two ingests of the
+same dataset at once (each process would download the same objects); one command can cover
+the whole range, and its year scenes share the cache.
+
+One tile per 15-minute step, `date` = `YYYY-MM-DDTHH:MM` (valid time, UTC). `series` accepts
+any prefix (`YYYY-MM-DD` returns 96 steps, `YYYY-MM-DDTHH` four); `mosaic` and `clip` need
+the full `YYYY-MM-DDTHH:MM`. Band `precipitation`, RAW m h-1 as published (x 1000 = mm/h),
+float32, nodata -9999. Amounts are a read-time derivation, never stored: the hourly amount is
+approximately the mean of its four instantaneous rates x 1 h. Lattice: cell centres on the 0.1
+deg lines (the store's latitude runs south to north and is flipped to north-up), anchor
+(-0.05, -0.05), 50 px tiles of 5 deg; Turkey is 8 tiles. `scene_id` names the segment
+(`NRT/2016_to_2025`, `NRT/2026_to_present`, `LR/1999_to_2023`).
+
+Measured on a 24-core desktop, Turkey (bbox 25.6 35.8 44.9 42.2,
+8 tiles), NRT 2016-2025, one ingest command per year in sequence: 2.8 M rows (350,657 steps x
+8 tiles), 1.6 GB on disk in the store plus 1.3 GB of cache (800 objects); about 7 minutes per
+year once the cache is filled, 10 minutes for the first year including the download, 70
+minutes in all; `--dry-run` over the whole range reported nothing missing. Stored values were
+checked once (2026-11-16) tile for tile against the publisher's map-chunked copy: all 8
+Turkey tiles at four steps between 2016 and 2025, one tile over two full days each of NRT and
+LR, and one tile over a day of live folders, all identical. There is no automated test
+against the bucket.
+
 ```python
 series("chirps", lon, lat, "precip", date="2026")            # mm/day per day
 series("modis_lst", lon, lat, "aqua_lst_day", date="2026-08") # raw DN, * 0.02 = K
@@ -305,6 +369,7 @@ series("era5", lon, lat, "t2m", date="2026-06-01")              # 24 hourly valu
 series("era5land", lon, lat, "t2m", date="2026-06-01")          # same at 0.1 deg
 series("agera5", lon, lat, "t2m_max", date="2026-06")           # daily maxima, K
 series("era5land_daily", lon, lat, "swvl1_mean", date="2026-06") # daily mean topsoil moisture, m3/m3
+series("pardig_nrt", lon, lat, "precipitation", date="2026-06-01") # 96 rates, m/h
 ```
 
 Static datasets need no date range:
@@ -379,7 +444,7 @@ clip("soilgrids", "parcel.geojson", "clay_0-5cm", "")
 
 Adding a dataset is one module under `src/geovault/sources/` (a `search` and an
 `ingest_scene` function) plus one line in the registry. The engine (grid, store,
-catalog, reader) never changes.
+catalog, reader) rarely needs to change.
 
 ## Credentials (only for non-anonymous sources)
 
@@ -420,7 +485,7 @@ geovault reencode agera5                # re-compress stored tiles with the curr
 geovault rebuild-catalog s2             # regenerate the catalog from the store
 ```
 
-Re-running an ingest is safe and cheap: cached tiles are skipped via the catalog,
+Re-running an ingest is safe and cheap: stored tiles are skipped via the catalog,
 so the same command serves both the initial backfill and incremental top-ups.
 Tiles are written to disk every 10 scenes and, for any ingest, whenever the
 buffer exceeds `--flush-mb` (default 256 MB), so an interrupted run keeps what
@@ -513,6 +578,8 @@ data/
   store/dataset=<d>/<YYYY>/<MM>/r<res>.parquet    sealed month
   store/dataset=<d>/<YYYY>/<MM>/r<res>.part-*.parquet  open parts (hot month)
   store/dataset=<d>/static/r<res>.parquet         static layers
+  cache/<dataset>/<archive folder>/               downloaded source objects (PARDIG archives); delete when no ingest runs
+  logs/<dataset>_<timestamp>.log                  one log per ingest run
 ```
 
 Row schema: `band, date, x, y, crs, res, tile_px, west/south/east/north (WGS84),
@@ -606,6 +673,7 @@ each provider's terms and license before fetching or publishing anything:
 | MODIS MOD14A1/MYD14A1, MCD64A1 | NASA LP DAAC, free; cite Giglio et al., attribution requested |
 | ERA5 (ARCO-ERA5 mirror) | Copernicus Climate Change Service (C3S) licence: free use with attribution ("Generated using Copernicus Climate Change Service information"); ARCO mirror by Google Research |
 | ERA5-Land, AgERA5 (CDS) | C3S licence as above, accepted once per dataset on the CDS website; your account, your requests |
+| PARDIG (Google WeatherNext) | CC BY 4.0, attribution required; experimental research product, not an official forecast or warning source |
 | AWS Open Data buckets | Each dataset's own terms apply, see the registry entry |
 | Microsoft Planetary Computer | Microsoft APIs terms of use, per-collection licenses |
 

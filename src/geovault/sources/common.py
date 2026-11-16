@@ -49,14 +49,21 @@ def _encode(arr, crs, transform, nodata, scale=None, offset=None, predictor=2) -
         return mem.read()
 
 
-def encode_blob(arr, crs, transform, nodata, scale=None, offset=None) -> bytes:
+def encode_blob(arr, crs, transform, nodata, scale=None, offset=None, predictor=None) -> bytes:
     """DEFLATE GeoTIFF blob of one tile (lossless), choosing the TIFF predictor per tile.
 
     Integer tiles use the horizontal differencing predictor (2). Float tiles are encoded
     with both predictor 2 and the floating-point predictor (3) and the smaller blob is kept:
     3 wins on smooth continuous fields (reanalysis temperature -17%, S1 gamma0 -7%) and
     loses on sparse quantised ones (precipitation +30%), so neither is right for all bands.
-    The choice is recorded in the TIFF itself; any reader decodes both."""
+    The choice is recorded in the TIFF itself; any reader decodes both.
+
+    `predictor` pins the choice (2 or 3; 3 only for float tiles) and skips the trial
+    encoding. Meant for sources with very many small tiles whose winner is known: it halves
+    the encoding time. Pixels are identical either way; only the blob size can differ.
+    `geovault reencode` does not know a source's pin and runs the trial again."""
+    if predictor is not None:
+        return _encode(arr, crs, transform, nodata, scale, offset, predictor)
     if np.issubdtype(arr.dtype, np.floating):
         b2 = _encode(arr, crs, transform, nodata, scale, offset, 2)
         b3 = _encode(arr, crs, transform, nodata, scale, offset, 3)
@@ -64,14 +71,15 @@ def encode_blob(arr, crs, transform, nodata, scale=None, offset=None) -> bytes:
     return _encode(arr, crs, transform, nodata, scale, offset, 2)
 
 
-def encode_geotiff(arr, grid, tx, ty, crs, nodata, scale=None, offset=None) -> bytes:
+def encode_geotiff(arr, grid, tx, ty, crs, nodata, scale=None, offset=None, predictor=None) -> bytes:
     """Encode one grid tile array as a DEFLATE GeoTIFF blob (lossless, self-describing).
 
     scale/offset, when given, are written as the GeoTIFF band scale and offset: the
     stored digital number stays raw (lossless) but the blob documents how to turn it
     into a physical value (Landsat Collection 2: reflectance and kelvin). Readers get
-    them from rasterio as ds.scales[0] / ds.offsets[0]."""
-    return encode_blob(arr, crs, Affine(*grid.tile_transform(tx, ty)), nodata, scale, offset)
+    them from rasterio as ds.scales[0] / ds.offsets[0]. `predictor`: see encode_blob."""
+    return encode_blob(arr, crs, Affine(*grid.tile_transform(tx, ty)), nodata, scale, offset,
+                       predictor)
 
 
 def reencode_blob(blob: bytes) -> bytes:
