@@ -57,9 +57,10 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
     """Fetch the requested bands of one scene over bbox/aoi; returns tiles written.
 
     Two waves: SCL first (the cloud_pct source), then the remaining bands in
-    parallel (one thread per band, each with its own COG handle). Tiles whose
-    center falls outside the scene's own UTM zone are skipped (canonical-zone
-    rule) unless keep_offzone is set.
+    parallel (one thread per band, each with its own COG handle). Granules of
+    neighbouring MGRS zones overlap: a tile that does not touch the zone of the
+    scene's CRS is left to the other zone's granule (common.tile_is_canonical)
+    unless keep_offzone is set.
     """
     bands = bands or DEFAULT_BANDS
     skip_keys = skip_keys or set()

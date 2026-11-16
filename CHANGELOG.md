@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.8.0 (2026-11-17)
+
+- Fix the zone rule of `s2`. A tile was stored only when its centre lay in the regular UTM
+  zone and hemisphere of its CRS, which lost ground in three ways: strips along every zone
+  line that neither zone stored (the two lattices are rotated against each other;
+  measured along 222 km of the 36 E line: 77 km2 at 10 m, 132 km2 at 20 m, different per
+  band resolution), a 640 m strip along the whole equator, and everything where MGRS does
+  not use the regular zones (south-west Norway between 3 and 6 E, parts of Svalbard): there
+  an ingest found the scenes and stored nothing or only part (nothing at Bergen), and
+  `--dry-run` reported nothing missing.
+  A tile is now stored when it touches the ground MGRS assigns to its CRS
+  (`common.tile_is_canonical`, `common.mgrs_zone_areas`). Each zone keeps tiles up to one
+  tile past the line, so a strip about one tile wide on average, at most two, is stored in
+  both CRS; `reader.series` at a point in it returns two records per date, one per CRS.
+- Fix `landsat` and `s1`: no zone rule. Their scenes come in the zone of the scene, not of
+  the ground, so the rule did not remove duplicates, it dropped scenes: every Landsat scene
+  of the southern hemisphere, which is delivered in the northern CRS (all 25 scenes of a
+  test area at Canberra), and near zone lines the scenes of the neighbouring zone (measured
+  at 37 N: 6 of 16 Landsat scenes 27 km from the 36 E line, 14 of 20 Sentinel-1 scenes
+  13 km from it). Every scene is stored in its own CRS. `--keep-offzone` now only concerns
+  `s2`.
+- Stores built before this change keep what they have. Re-running an ingest fetches the
+  tiles the old rule left out; `--dry-run` reports them as missing, so it exits 1 on a
+  store it used to call complete. An `s2` store in south-west Norway or on Svalbard keeps
+  the regular-zone tiles it has next to the MGRS-zone tiles it gains.
+- `reader.mosaic` and `reader.clip` return one CRS, as before, but prefer the zone MGRS
+  assigns to the bbox centre (it was the regular zone, which holds only a strip of tiles
+  where MGRS departs from it). They warn when tiles of another CRS hold observations on
+  ground of the request where the result has none. Observed pixels are compared, on a
+  lattice of points over the request, so a parcel-sized request is judged too; `clip`
+  judges the polygon, part by part, not its bbox. Code that turns warnings into errors
+  has to expect it for a request across a zone line.
+- Fix `reader.clip`: pixels outside the polygon are set to the band's nodata value, as
+  documented. They were set to 0 for unsigned bands and to -32768 for all others, whatever
+  the band's nodata was. On unsigned bands whose nodata is not 0 the fill was a value of
+  its own (`reliability` of `modis_vi`, where 0 is good data, `good` of `modis_vi_1km`,
+  `MASK` of `gedtm30`, `qa_pixel` of `landsat`); on signed and float bands with another
+  nodata (-9999 of the DEM, reanalysis and precipitation sources, -3000 of MODIS NDVI, ...)
+  it was a second marker next to the band's own. Code that tested clipped arrays against
+  -32768 must test against the band's nodata, or use `masked=True`. Bands whose nodata
+  already was 0 or -32768 (`s2`, `s1`, `landsat` reflectance, `worldcover`, `soilgrids`,
+  `nasadem`, `modis_lst`) are unchanged.
+- Fix `reader.mosaic` and `reader.clip` on bands without a nodata value (`max_frp`, `qa`,
+  `sample` of `modis_fire`; `qa`, `uncertainty` of `modis_burned`): every call failed with a
+  `TypeError`. A mosaic of a band whose nodata is NaN no longer comes back empty, and
+  `reader.series` skips its NaN pixels.
+- `reader.mosaic` and `reader.clip` take `masked=True` and then return a numpy masked array:
+  masked where no stored tile covers a pixel, where the tile holds nodata, and for `clip`
+  outside the polygon. A band without a nodata value can only be read this way; without
+  `masked=True` it raises a `ValueError` that says so.
+- `reader.series` records carry the `crs` of the tile they come from. Fix: a point less
+  than a pixel west or north of a stored tile was given that tile's edge pixel, as a
+  second record for the date or as a value for ground no tile holds.
+- Tests: `tests/test_zone_rule.py` (every point lies in a kept tile of its own MGRS zone:
+  across zone lines in both hemispheres, the antimeridian, the equator, and through the
+  whole width of the Norway and Svalbard zones, at 10, 20 and 60 m; Landsat and Sentinel-1
+  plans ignore the zone) and `tests/test_reader_mosaic.py` (fill values of mosaic and clip,
+  bands without nodata, NaN nodata, the masked return, cleanest tile first, the CRS a
+  mosaic takes, the series fixes, and the warning: parcel-sized requests, small and thin
+  parts of a polygon, nodata in kept and in left-out tiles, the edge of a swath stored in
+  both CRS).
+
 ## 0.7.0 (2026-11-16)
 
 - Two precipitation sources from Google's public WeatherNext bucket, no account (extra

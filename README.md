@@ -561,7 +561,27 @@ geovault ingest --dataset s2 --point 36.735 35.325 --buffer 250 --start ... --en
 
 The mosaic is nodata-aware (overlapping tiles fill each other's gaps, the tile
 with the lowest cloud_pct wins where both have data) and resolves to a single
-CRS when the bbox spans a UTM zone boundary.
+CRS when the bbox spans a UTM zone boundary (see
+[UTM zones](#utm-zones-which-crs-a-tile-is-stored-in)).
+
+`mosaic` and `clip` mark a pixel without an observation with the band's own
+nodata value (`read_tile(row)[1]["nodata"]`): where no stored tile covers it,
+where the tile holds nodata, and for `clip` outside the polygon. `masked=True`
+returns a numpy masked array with exactly those pixels masked, so no nodata
+value has to be known:
+
+```python
+arr, transform, crs = clip("chirps", "parcel.geojson", "precip", "2026-07-14", masked=True)
+arr.mean()                                    # over the observed pixels inside the polygon
+```
+
+Some bands have no nodata value because every value is a measurement (for
+example the `max_frp`, `qa` and `sample` bands of `modis_fire`, `qa` and
+`uncertainty` of `modis_burned`). They can only be read with `masked=True`;
+without it `mosaic` and `clip` raise a `ValueError` instead of filling the gaps
+with a value that would read as data. Work on such an array through its mask
+(`arr.mask`, `arr.compressed()`, the masked reductions): `np.asarray(arr)` and
+`arr.filled()` drop the mask and leave an arbitrary number in the masked pixels.
 
 No Python required on the consumer side; any DuckDB client works:
 
@@ -630,13 +650,45 @@ rows up to date. Done 2026-09-18: `agera5` 404k tiles 9.62 -> 8.52 GB (-11%, 17 
 `s1` 15k tiles 3.47 -> 3.22 GB (-7%). `chirps` gains nothing (predictor 2 already wins
 on precipitation) and is left as is.
 
-### UTM zone boundary rule
+### UTM zones: which CRS a tile is stored in
 
-Ground near a zone boundary appears in scenes of both zones, with different CRS
-and tile numbers, so the key alone cannot tell they are the same ground. By default
-a tile is stored only from the scene of its center's canonical zone; `--keep-offzone`
-disables the rule. The
-reader's mosaic also prefers the zone of the bbox center.
+Tiles are stored in the CRS their scene comes in, and the CRS is part of the tile key.
+What that means near a zone line depends on how the product is gridded.
+
+**Sentinel-2** follows the MGRS grid. Granules of neighbouring zones overlap by tens of
+kilometres, and so do the granules north and south of the equator, so the same ground
+arrives on the same day in two CRS; the key cannot tell they are the same ground. One of
+the two is kept: a tile is stored when it touches the ground MGRS assigns to its CRS (the
+6 degree zone on one side of the equator; zone 32 widened to 3-12 E between 56 and 64 N;
+the wide zones 31, 33, 35 and 37 between 72 and 84 N). Every point has a granule in its
+own zone and lies in a kept tile of it, so nothing is lost. Each zone keeps tiles up to
+one tile past the line, so a strip about one tile wide on average, at most two, is stored
+in both CRS (measured along the 36 E line between 36 and 42 N: 2.6 km on average at 10 m,
+5.4 km at 20 m, 15 km at 60 m). `--keep-offzone` stores every tile of every granule
+instead.
+
+**Landsat and Sentinel-1** scenes come in the zone of the scene, not of the ground:
+within half a scene's width of a zone line (up to about 90 km for Landsat, more for
+Sentinel-1) the same ground is imaged in one zone's CRS on some dates and in the
+neighbour's on others, and Landsat uses the northern CRS on both sides of the equator.
+Every scene is stored in its own CRS, with no rule by location: such a rule would drop
+those dates, not a duplicate. Two overlapping scenes of one pass can fall in different
+zones; their overlap is then stored in both CRS for that date.
+
+For reading this means:
+
+- `mosaic` and `clip` return one CRS per call. Over an area stored in several they use
+  the zone MGRS assigns to the bbox center when it has tiles, else the CRS with the most
+  tiles, and warn when tiles of another CRS hold observations on ground of the request
+  where the result has none (a polygon across a zone line: read each side separately).
+  The check compares observed pixels on a lattice of points over the request; a left-out
+  strip narrower than an eighth of a tile can go unnoticed on a large request.
+- Near a zone line a Landsat or Sentinel-1 series can change CRS from one date to the
+  next, so two dates of the same bbox are not always on the same pixel grid. Compare the
+  returned `crs` and `transform` before stacking dates.
+- `series` returns one record per stored tile at the point, so a point stored in two
+  CRS (the Sentinel-2 strip, overlapping Landsat or Sentinel-1 scenes of two zones)
+  yields two records for a date; each record names its `crs`.
 
 ## Development
 

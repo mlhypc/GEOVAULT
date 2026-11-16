@@ -57,7 +57,8 @@ def main(argv=None):
     p.add_argument("--workers", type=int, default=3,
                    help="scenes fetched concurrently (each scene already reads its bands in parallel); default 3")
     p.add_argument("--keep-offzone", action="store_true",
-                   help="allow duplicate storage across UTM zone boundaries")
+                   help="Sentinel-2: also store the tiles of a granule that lie in the neighbouring "
+                        "MGRS zone or hemisphere (the same ground is then stored in two CRS)")
     p.add_argument("--flush-mb", type=float, default=256,
                    help="write buffered tiles to disk once they exceed this many MB (default 256); "
                         "an interrupted run keeps every flushed part file")

@@ -32,6 +32,14 @@ the Sentinel grids, and not per scene as Grid.from_transform would do (a
 per-scene anchor modulo the tile size differs between scenes and would break the
 dedup key). 256 px tiles = 7.68 km.
 
+CRS: a scene comes in the UTM zone of the scene, not of the ground under each pixel,
+and in the northern CRS (EPSG:326xx) on both sides of the equator. Within half a scene's
+width of a zone line the same ground is therefore imaged in one zone's CRS on some
+dates and in the neighbour's on others. Every scene is stored in the CRS it comes in;
+a rule by ground location would drop those dates (and the whole southern hemisphere).
+Two overlapping scenes of one path can fall in different zones; their overlap is then
+stored in both CRS for that date.
+
 Asset hrefs must be signed (planetary_computer.sign); anonymous signing works,
 a free API key only raises rate limits. Planetary Computer publishes a Landsat
 scene about a week after acquisition (USGS L2 processing plus their ingest);
@@ -140,7 +148,8 @@ def plan_scene(item, bbox, bands=None, skip_keys=None, keep_offzone=False, aoi=N
     for band in bands:
         if _asset_key(item, band) is None:
             continue
-        n = len(common.plan_tiles(grid, bbox, crs, band, date, skip_keys, keep_offzone, in_aoi))
+        # keep_offzone=True: the zone rule is for MGRS-gridded products; a scene is stored in its own CRS
+        n = len(common.plan_tiles(grid, bbox, crs, band, date, skip_keys, True, in_aoi))
         if n:
             out[band] = n
     return out
@@ -168,7 +177,8 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
         key = _asset_key(item, band)
         if key is None:
             return []
-        todo = common.plan_tiles(grid, bbox, crs, band, date, skip_keys, keep_offzone, in_aoi)
+        # keep_offzone=True: the zone rule is for MGRS-gridded products; a scene is stored in its own CRS
+        todo = common.plan_tiles(grid, bbox, crs, band, date, skip_keys, True, in_aoi)
         if not todo:
             return []
         nodata = NODATA_QA if band == QA_BAND else NODATA

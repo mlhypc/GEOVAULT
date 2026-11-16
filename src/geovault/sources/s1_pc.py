@@ -5,6 +5,12 @@ sentinel-1-rtc. RTC is radiometrically terrain corrected gamma0, a better
 analysis product than raw GRD (terrain shadow and foreshortening corrected).
 10 m, UTM, float32, nodata -32768.
 
+CRS: a scene comes in the UTM zone of the scene, not of the ground under each pixel,
+so within half a scene's width of a zone line the same ground is imaged in one zone's CRS
+on some passes and in the neighbour's on others. Every scene is stored in the CRS it
+comes in; a rule by ground location would drop those passes. Two overlapping scenes of
+one pass can fall in different zones; their overlap is then stored in both CRS.
+
 Asset hrefs must be signed (planetary_computer.sign); anonymous signing works,
 a free API key only raises rate limits.
 """
@@ -58,7 +64,8 @@ def plan_scene(item, bbox, bands=None, skip_keys=None, keep_offzone=False, aoi=N
     for band in bands:
         if BANDS[band] not in item.assets:
             continue
-        n = len(common.plan_tiles(grid, bbox, crs, band, date, skip_keys, keep_offzone, in_aoi))
+        # keep_offzone=True: the zone rule is for MGRS-gridded products; a scene is stored in its own CRS
+        n = len(common.plan_tiles(grid, bbox, crs, band, date, skip_keys, True, in_aoi))
         if n:
             out[band] = n
     return out
@@ -83,8 +90,9 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
             key = BANDS[band]
             if key not in item.assets:
                 continue
+            # keep_offzone=True: the zone rule is for MGRS-gridded products; a scene is stored in its own CRS
             todo = common.plan_tiles(grid, bbox, crs, band, date, skip_keys,
-                                     keep_offzone, in_aoi)
+                                     True, in_aoi)
             if not todo:
                 continue
             with rasterio.open(item.assets[key].href) as ds:
