@@ -140,7 +140,10 @@ def main(argv=None):
         return 0
 
     if a.cmd == "coverage":
-        rows = catalog.coverage(a.dataset, tuple(a.bbox) if a.bbox else None, a.date)
+        try:
+            rows = catalog.coverage(a.dataset, tuple(a.bbox) if a.bbox else None, a.date)
+        except ValueError as exc:
+            ap.error(str(exc))
         if not rows:
             print("no records")
             return 0

@@ -157,7 +157,7 @@ def touches_zone(wgs84_bounds, zone):
     """True when the tile overlaps the longitude band of UTM zone `zone`."""
     w, s, e, n = wgs84_bounds
     zone_west = -180.0 + (zone - 1) * 6.0
-    return w < zone_west + 6.0 and e > zone_west
+    return common.lon_overlap(w, e, zone_west, zone_west + 6.0)
 
 
 def _open_all(files, log):

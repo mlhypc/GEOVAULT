@@ -599,6 +599,10 @@ SELECT * FROM read_parquet('GEOVAULT/data/catalog/s2.parquet')
 WHERE east > ? AND west < ? AND date LIKE '2024-06%';
 ```
 
+(A tile of a projected CRS across the antimeridian has `west > east`; a query near 180
+degrees has to allow for it, as `catalog.bbox_sql` does. A request bbox across the
+antimeridian is refused: ask for its two parts.)
+
 ## Storage layout
 
 ```
@@ -615,7 +619,12 @@ data/
 
 Row schema: `band, date, x, y, crs, res, tile_px, west/south/east/north (WGS84),
 nodata, cloud_pct, scene_id, data (GeoTIFF blob), size_bytes, fetched_at, acq,
-valid_px`. `valid_px` is the number of pixels holding an observation.
+valid_px`. `valid_px` is the number of pixels holding an observation. The bounds hold
+the ground of the tile, and sometimes more. Those of a tile of a projected CRS across
+the antimeridian have `west > east`, as a bbox has in GeoJSON and STAC: its ground
+runs from `west` up to 180 and from -180 up to `east`. A tile that holds a pole spans
+-180 to 180. A tile of a geographic grid keeps the longitudes of the grid, which can
+run past 180.
 Logical key: `(dataset, band, date, acq, crs, x, y)`. The CRS is part of the key because
 UTM tile numbers restart in every zone: the same `(x, y)` in zones 35 and 36 is ground
 six degrees apart. `acq` is part of it because a satellite can image the same ground

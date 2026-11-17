@@ -39,6 +39,8 @@ def tile_filter(aoi):
         # there anyway, so such a tile never intersects.
         if not all(math.isfinite(v) for v in b):
             return False
+        if b[0] > b[2]:                     # a tile across the antimeridian: both its ends
+            return hit(box(b[0], b[1], 180.0, b[3])) or hit(box(-180.0, b[1], b[2], b[3]))
         return hit(box(b[0], b[1], b[2], b[3]))
     return f
 

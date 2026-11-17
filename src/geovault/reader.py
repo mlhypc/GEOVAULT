@@ -29,8 +29,7 @@ def tiles_for_bbox(dataset, bbox, band=None, date=None) -> list:
     p = catalog.path(dataset)
     if not p.exists():
         return []
-    w, s, e, n = bbox
-    where = [f"east > {w} AND west < {e} AND north > {s} AND south < {n}"]
+    where = [catalog.bbox_sql(bbox)]
     if band:
         where.append(f"band = '{band}'")
     if date:
@@ -81,7 +80,9 @@ def _request_points(bbox, within, row):
     exceeds an eighth of a tile only once a request is wider than 64 tiles. Each part of
     a geometry gets its own lattice, its vertices and a point inside it, so a small or
     thin part is never skipped."""
-    step_x, step_y = (row["east"] - row["west"]) / 8, (row["north"] - row["south"]) / 8
+    # the width of the tile in longitude, also when it lies across the antimeridian
+    step_x = ((row["east"] - row["west"]) % 360 or 360.0) / 8
+    step_y = (row["north"] - row["south"]) / 8
 
     def lattice(w, s, e, n, least):
         nx = int(np.clip(np.ceil((e - w) / step_x), least, 512))

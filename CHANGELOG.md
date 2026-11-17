@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.10.3 (2026-11-17)
+
+- A tile across the antimeridian could not be found where it lies. Its WGS84 bounds
+  were the smallest and the largest longitude of its corners, about -180 and 180:
+  everything on that latitude except the tile. A request on its own ground (a point
+  at 179.99 E, a bbox across its west-longitude end) did not match it, so `series`,
+  `mosaic` and `clip` returned nothing there, and every request elsewhere on that
+  latitude got it as a candidate. The bounds of such a tile are now stored with
+  `west > east`, as a bbox is in GeoJSON and STAC (`common.wgs84_bounds`), and the
+  bbox test of the catalog (`catalog.bbox_sql`, used by `reader.tiles_for_bbox` and
+  `catalog.coverage`), the AOI filter of an ingest, the MGRS zone rule and the 3DEP
+  zone test read them that way. Concerned are the tiles of a projected CRS that lie
+  across the antimeridian: in UTM zones 1 and 60, on polar grids, and the sinusoidal
+  (MODIS) tiles at the two ends of the projection. A geographic grid has no such
+  tile: its tiles keep the longitudes of the grid, which can run past 180, as before.
+- Beside a pole the bounds of a tile left ground out. They were taken from its four
+  corners, but the point of a tile nearest the pole lies on an edge or inside it. On
+  a polar stereographic grid with tiles of 256 km the tile holding the pole stopped
+  183 km short of it and the tile beside that one 54 km short of its own ground (1.8
+  and 0.5 km with tiles of 2.56 km); the sinusoidal tiles under a pole spanned a part
+  of the longitudes of their ground (58 of 180 degrees at 500 m). `common.wgs84_bounds`
+  now follows the outline of a tile, 8 points per edge and its point nearest each
+  pole, so the bounds hold the ground of the tile. A tile that holds a pole, or lies
+  within a pixel of one, spans every longitude and reaches the pole; a tile around
+  the world spans every longitude; a tile that reaches past the edge of its
+  projection gets bounds wider than its ground (a sinusoidal tile at one end of the
+  projection reaches a few degrees onto the other end). Measured against ground
+  sampled on the edges and inside the tiles: nothing left out on polar and sinusoidal
+  grids, at most 0.003 pixel on UTM tiles and 0.05 pixel on conic tiles of 256 km.
+  The bounds of other tiles change only where an edge bulges past the corners, as on
+  a UTM tile across the central meridian of its zone (0.004 pixel at 10 m); they are
+  the same to the last digit on 1,644 tiles of UTM and sinusoidal grids at 34 to
+  44 N. A tile with a corner off the projection still has no finite bounds and is
+  not planned for an area. The bounds are computed once per tile in a process, since
+  an ingest asks for them for every band and scene.
+- `catalog.bbox_sql`, and so `reader.tiles_for_bbox`, `catalog.coverage` and the
+  `coverage` command, refuses a bbox with west > east, south > north or a value that
+  is not finite with a `ValueError`. (Such a bbox matched only tiles spanning the
+  whole world, or failed inside DuckDB.) A request bbox across the antimeridian is
+  not supported: ask for its two parts.
+- Tiles stored before keep the bounds they were stored with, and an ingest skips a
+  tile it already holds: a store with tiles across the antimeridian or beside a pole
+  has to be fetched again for them to be found there.
+- Tests: `tests/test_tile_bounds.py`, 24 tests (the ground of a tile, sampled on its
+  edges and inside, lies in its bounds on UTM, polar, sinusoidal, Mercator and
+  interrupted grids; a pole inside a tile, on an edge and on a corner; a tile wider
+  than half the world and one around it), and `tests/test_antimeridian.py`, 15 tests
+  (the bounds of a tile across the antimeridian and of its neighbours; the AOI
+  filter, the zone rule and the 3DEP zone test; a bbox, a point and a mosaic on both
+  sides; no match elsewhere; a bbox the wrong way round; a geographic grid).
+
 ## 0.10.2 (2026-11-17)
 
 - An ingest left tiles out of its plan along one edge of the area. `common.bbox_to_crs`

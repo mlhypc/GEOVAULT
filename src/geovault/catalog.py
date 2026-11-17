@@ -6,6 +6,7 @@ WGS84 bbox, cloud_pct, scene_id, size, source file, crs, acq, valid_px. The stor
 truth; the catalog is a derived index, rebuilt after every ingest.
 """
 
+import math
 from pathlib import Path
 
 import duckdb
@@ -17,6 +18,20 @@ CATALOG = ROOT / "catalog"
 
 def path(dataset: str) -> Path:
     return CATALOG / f"{dataset}.parquet"
+
+
+def bbox_sql(bbox) -> str:
+    """SQL test on catalog rows: does the tile touch the WGS84 bbox (w, s, e, n)? A row
+    with west > east is a tile across the antimeridian (see common.wgs84_bounds). The
+    bbox itself may not cross it: one with west > east is refused, since it would match
+    nothing."""
+    w, s, e, n = bbox
+    if not (all(math.isfinite(v) for v in bbox) and w <= e and s <= n):
+        raise ValueError(f"bbox {tuple(bbox)} is not (west, south, east, north) with west <= east "
+                         f"and south <= north. A bbox across the antimeridian is not supported: "
+                         f"ask for its two parts")
+    return (f"north > {s} AND south < {n} AND CASE WHEN west <= east "
+            f"THEN east > {w} AND west < {e} ELSE east > {w} OR west < {e} END")
 
 
 def rebuild(dataset: str) -> int:
@@ -52,8 +67,7 @@ def coverage(dataset: str, bbox=None, date=None) -> list:
     con = duckdb.connect()
     where = ["1=1"]
     if bbox:
-        w, s, e, n = bbox
-        where.append(f"east > {w} AND west < {e} AND north > {s} AND south < {n}")
+        where.append(bbox_sql(bbox))
     if date:
         where.append(f"date LIKE '{date}%'")
     rows = con.execute(

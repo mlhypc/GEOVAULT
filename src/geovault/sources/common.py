@@ -9,7 +9,7 @@ import math
 
 import numpy as np
 import rasterio
-from pyproj import Transformer
+from pyproj import CRS, Transformer
 from rasterio.transform import Affine
 from rasterio.windows import from_bounds
 
@@ -162,11 +162,104 @@ def _transformer(src: str, dst: str) -> Transformer:
     return Transformer.from_crs(src, dst, always_xy=True)
 
 
+@lru_cache(maxsize=64)
+def _is_geographic(crs: str) -> bool:
+    return CRS.from_user_input(crs).is_geographic
+
+
+def lon_overlap(w: float, e: float, aw: float, ae: float) -> bool:
+    """Do the longitude spans w..e and aw..ae share ground? w > e is a span across the
+    antimeridian (w up to 180, then -180 up to e); aw..ae does not cross it."""
+    if w <= e:
+        return w < ae and e > aw
+    return w < ae or e > aw
+
+
+# The outline of a tile is followed in this many steps per edge for its WGS84 bounds.
+OUTLINE_STEPS = 8
+_EDGE = np.arange(OUTLINE_STEPS) / OUTLINE_STEPS
+# The outline of the unit square, anticlockwise from its south-west corner, and two spare
+# points: the point of the tile nearest each pole.
+_OUTLINE_X = np.concatenate([_EDGE, np.ones(OUTLINE_STEPS), 1 - _EDGE, np.zeros(OUTLINE_STEPS + 2)])
+_OUTLINE_Y = np.concatenate([np.zeros(OUTLINE_STEPS), _EDGE, np.ones(OUTLINE_STEPS), 1 - _EDGE,
+                             np.zeros(2)])
+_CORNERS = [0, OUTLINE_STEPS, 3 * OUTLINE_STEPS, 2 * OUTLINE_STEPS]      # sw, se, nw, ne
+
+
+@lru_cache(maxsize=64)
+def _poles(crs: str) -> tuple:
+    """(x, y, latitude) of each pole that has a place in the CRS."""
+    found = []
+    for lat in (90.0, -90.0):
+        x, y = _transformer("EPSG:4326", crs).transform(0.0, lat)
+        if math.isfinite(x) and math.isfinite(y):
+            found.append((x, y, lat))
+    return tuple(found)
+
+
 def wgs84_bounds(grid, tx, ty, crs) -> tuple:
-    """Tile corners reprojected to WGS84 (w, s, e, n) for uniform bbox queries."""
+    """WGS84 bounds (w, s, e, n) of a tile, for uniform bbox queries: they hold the
+    ground of the tile, and sometimes more.
+
+    In a projected CRS they are taken along the outline of the tile, OUTLINE_STEPS points
+    per edge, and at its point nearest each pole. An edge is a curve in longitude and
+    latitude: the four corners alone leave out what bulges past them, tens of kilometres
+    of latitude beside a pole. (Between two outline points an edge still bulges past
+    the bounds: under a twentieth of a pixel on tiles 256 km wide of UTM, conic, polar
+    and sinusoidal grids, less on smaller tiles, more on a tile far outside the area
+    its projection is made for.)
+
+    - A tile across the antimeridian has west > east, as a bbox has in GeoJSON and STAC:
+      its ground runs from west up to 180 and from -180 up to east. (The smallest and
+      the largest longitude of such a tile span everything but the tile.) The tile lies
+      on one side of the widest gap between the longitudes of its outline; where that
+      gap is no wider than a step along the outline, the tile spans every longitude.
+    - A tile that holds a pole, or lies within a pixel of one, spans every longitude and
+      reaches the pole.
+    - A tile with a corner off the projection has no finite bounds, and one that reaches
+      past the edge of the projection gets bounds wider than its ground.
+    - A tile of a geographic CRS has the bounds of its corners, in the longitudes of its
+      grid, which may run past 180."""
+    return _wgs84_bounds(grid, tx, ty, str(crs))
+
+
+@lru_cache(maxsize=1 << 16)
+def _wgs84_bounds(grid, tx: int, ty: int, crs: str) -> tuple:
+    """One ingest asks for the bounds of a tile once per band and scene."""
     w, s, e, n = grid.tile_bounds(tx, ty)
-    xs, ys = _transformer(str(crs), "EPSG:4326").transform([w, e, w, e], [s, s, n, n])
-    return (min(xs), min(ys), max(xs), max(ys))
+    to_wgs84 = _transformer(crs, "EPSG:4326")
+    if _is_geographic(crs):
+        xs, ys = to_wgs84.transform([w, e, w, e], [s, s, n, n])
+        return (min(xs), min(ys), max(xs), max(ys))
+    x, y = w + (e - w) * _OUTLINE_X, s + (n - s) * _OUTLINE_Y
+    held = []                                       # the latitude of a pole the tile holds
+    for spare, (px, py, pole) in zip((-1, -2), _poles(crs)):
+        nx, ny = min(max(px, w), e), min(max(py, s), n)     # the point of the tile nearest the pole
+        if math.hypot(nx - px, ny - py) <= grid.res:
+            held.append(pole)
+        else:
+            x[spare], y[spare] = nx, ny
+    lon, lat = to_wgs84.transform(x, y)
+    cx, cy = lon[_CORNERS], lat[_CORNERS]
+    if not (np.isfinite(cx).all() and np.isfinite(cy).all()):
+        return (float(cx.min()), float(cy.min()), float(cx.max()), float(cy.max()))
+    lat = np.append(lat[np.isfinite(lat)], held)
+    south, north = float(lat.min()), float(lat.max())
+    if held:
+        return (-180.0, south, 180.0, north)
+    lon = lon[:-2]
+    west, east = float(lon.min()), float(lon.max())
+    if -180 <= west and east <= 180 and east - west < 180:      # the usual tile
+        return (west, south, east, north)
+    lon = lon[np.isfinite(lon)]
+    lon = np.where(np.abs(lon) > 180, (lon + 180) % 360 - 180, lon)      # a CRS with +over
+    order = np.sort(lon)
+    gaps = np.diff(order, append=order[0] + 360)
+    widest = int(gaps.argmax())
+    step = np.abs((np.diff(lon, append=lon[0]) + 180) % 360 - 180).max()
+    if gaps[widest] <= step + 1e-9:
+        return (-180.0, south, 180.0, north)
+    return (float(order[(widest + 1) % order.size]), south, float(order[widest]), north)
 
 
 # The edges of a bbox are followed in steps of this many degrees when it is reprojected.
@@ -283,13 +376,13 @@ def tile_is_canonical(grid, tx, ty, crs) -> bool:
     leave ground on both sides of a line in no kept tile: the two lattices are rotated
     against each other, and shifted at the equator.)
 
-    The tile's WGS84 extent is the envelope of its corners, which is exact in longitude
-    and never too small where it decides. A CRS that is not a UTM zone has no zone rule."""
+    The tile's WGS84 extent is wgs84_bounds, which is never smaller than the tile. A CRS
+    that is not a UTM zone has no zone rule."""
     zone = crs_utm_zone(crs)
     if zone is None:
         return True
     w, s, e, n = wgs84_bounds(grid, tx, ty, crs)
-    return any(w < ae and e > aw and s < an and n > as_
+    return any(lon_overlap(w, e, aw, ae) and s < an and n > as_
                for aw, as_, ae, an in mgrs_zone_areas(*zone))
 
 
