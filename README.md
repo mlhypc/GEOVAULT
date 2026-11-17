@@ -495,7 +495,8 @@ it fetched. After a crash: `geovault compact <dataset>` seals the part files
 left behind (the next ingest does this too), then re-run the same ingest
 command; it fetches only the tiles that are still missing.
 
-Failures are per scene, not per run: a scene whose fetch raises is reported as
+Failures are per scene, not per run (a write that fails at the close of a chunk is
+the exception, see Write pattern): a scene whose fetch or write raises is reported as
 `FAILED`, the other scenes of its chunk are still written, the failed ids are
 listed at the end and the exit code is 2. Re-running the same command retries
 exactly those scenes. A native crash inside GDAL cannot be caught this way (the
@@ -607,6 +608,7 @@ data/
   store/dataset=<d>/<YYYY>/<MM>/r<res>.part-*.parquet  open parts (hot month)
   store/dataset=<d>/static/r<res>.parquet         static layers
   store/dataset=<d>/**/*.parquet.tmp              a write in progress; one left by a killed run is never read, delete it
+  store/dataset=<d>/**/*.parquet.old              a sealed month moved aside for its new file; never delete one whose month has no sealed file (see Write pattern)
   cache/<dataset>/<archive folder>/               downloaded source objects (PARDIG archives); delete when no ingest runs
   logs/<dataset>_<timestamp>.log                  one log per ingest run
 ```
@@ -634,8 +636,8 @@ overpass within its date, and two overpasses are two tiles:
 | Source | `acq` | Example |
 |---|---|---|
 | `s2` | datatake id without the processing baseline | `GS2C_20260305T081821_007813` |
-| `s1` | platform and absolute orbit | `sentinel-1a_63436` |
-| `landsat` | platform and WRS path | `landsat-9_175` |
+| `s1` | platform (lower case) and absolute orbit | `sentinel-1a_63436` |
+| `landsat` | platform (lower case) and WRS path | `landsat-9_175` |
 
 The same `acq` comes back on other dates (a Landsat satellite repeats a path every 16
 days); it is the date and `acq` together that name one overpass. An overpass that
@@ -674,9 +676,9 @@ touches nothing else. The Writer flushes every 10 scenes and whenever its buffer
 holds more than `--flush-mb` of tiles (default 256 MB; a 900 MB WorldCover run
 is four parts). Once a month spans more than 3 files it is auto-compacted
 into a single sealed file at close, and **every finished run seals all the months
-it touched**, so part files exist only while a run is in progress (or after a
-crash). `geovault compact <dataset>` does the same on demand and doubles as crash
-repair. Readers go through the catalog's `file` column, so parts are transparent
+it touched**, so part files exist only while a run is in progress, after a crash,
+or when another program held one open while its month was sealed. `geovault compact
+<dataset>` does the same on demand and doubles as repair after either. Readers go through the catalog's `file` column, so parts are transparent
 to them either way. Compaction is also where rows sharing a key are resolved: a
 re-fetched tile keeps its newest copy, and the scenes of one acquisition are merged
 into one tile. Until then such a tile is one row per scene, each partly empty, and
@@ -684,6 +686,26 @@ readers see those rows. `Writer.close()` merges the months written since the las
 merge; after `close(merge=False)`, or when another process held the month, call
 `store.compact(dataset)`. When an ingest could not seal a month it says so and names
 the command.
+
+What a failure costs. A part that cannot be written (disk full, a file in the way)
+raises; the other months of that flush are still written and the tiles that are not
+on disk stay in the Writer's buffer, so a later flush of the same Writer stores them.
+In `geovault ingest` an automatic flush that fails is reported on the scenes that add
+a tile while the cause lasts, and a failure at the close of a chunk ends the run:
+what was flushed before is kept, a re-run fetches the rest.
+
+A compaction puts the new month file in place before it deletes a part, so a file
+another program holds open costs no tiles. A part that cannot be deleted stays an
+open part whose tiles are in the sealed file too (the catalog lists them twice)
+until the next compaction. A reader that holds the sealed file the way DuckDB does,
+sharing it for deletion, keeps reading the old file, which is moved aside as
+`.parquet.old` and deleted; a program that holds it without that sharing (a plain
+file handle, pyarrow) makes the compaction fail and leaves the month as it was. A
+sealed file that stays aside, because the run was killed between the two renames or
+the file could not be moved back, leaves its month without a sealed file until
+`geovault compact` puts it back (delete the lock file of a killed run first). Files
+are not synced to disk before they are renamed: a power cut right after a compaction
+can cost the month.
 
 ### File layout (row groups)
 

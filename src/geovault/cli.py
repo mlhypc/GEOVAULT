@@ -41,7 +41,8 @@ def _report_open(dataset, say) -> None:
     left = _store.open_months(dataset)
     if not left:
         return
-    say(f"  {len(left)} (res, month) groups are still open, their tiles not merged yet: "
+    say(f"  {len(left)} (res, month) groups are not sealed (open part files, or a sealed "
+        f"file left aside): "
         + ", ".join(f"{date[:7] or 'static'} r{int(res)}" for res, date in left))
     locks = [_store.lock_file(dataset, res, date) for res, date in left]
     locks = [str(f) for f in locks if f.exists()]
@@ -51,7 +52,8 @@ def _report_open(dataset, say) -> None:
         say(f"  when no geovault process is running, delete the lock files and run "
             f"`geovault compact {dataset}`")
     else:
-        say(f"  run `geovault compact {dataset}`")
+        say(f"  a file of theirs was held open by another program, or a run was interrupted: "
+            f"run `geovault compact {dataset}` once nothing holds them")
 
 
 def main(argv=None):
@@ -89,7 +91,8 @@ def main(argv=None):
     p.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
     p.add_argument("--date")
 
-    p = sub.add_parser("compact", help="seal a dataset's open month part files")
+    p = sub.add_parser("compact", help="seal a dataset's open month part files (and put back a "
+                                       "sealed file an interrupted run left aside)")
     p.add_argument("dataset")
 
     p = sub.add_parser("rebuild-catalog", help="regenerate the catalog from the store")
@@ -127,6 +130,7 @@ def main(argv=None):
                   f"  {time.time() - t0:.0f}s", flush=True)
         print(f"reencoded {n} tiles: {tb / 1e9:.2f} -> {ta / 1e9:.2f} GB "
               f"({(ta - tb) / max(tb, 1) * 100:+.0f}%)")
+        _report_open(a.dataset, print)
         catalog.rebuild(a.dataset)
         return 0
 

@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.10.1 (2026-11-17)
+
+Three ways the store could lose or split tiles; all of them older than 0.10.0.
+`s1` tiles stored by 0.9.0 or 0.10.0 from scenes whose platform the catalogue spells
+in upper case carry that spelling in `acq` (`WHERE acq <> lower(acq)` finds them):
+delete those months and ingest them again.
+
+- A compaction (and `reencode`) deleted the month's files one by one and only then
+  renamed the new file into place. When a part could not be deleted, because another
+  program held it open, the sealed file was already gone and its rows existed only in
+  a `.parquet.tmp` that the next compaction overwrote (reproduced on Windows: a month
+  of four tiles came back with one). The new file is now put in place first
+  (`store._seal`) and a part that cannot be deleted stays an open part, resolved by
+  the next compaction. Windows refuses to rename over a file a reader has open; when
+  the reader shares the file for deletion, as DuckDB does, the old sealed file is
+  moved aside as `.parquet.old` for that instant and moved back if the new one cannot
+  take its place. A sealed file held without that sharing (a plain file handle,
+  pyarrow) still makes the compaction raise, with the month as it was. A sealed file
+  left aside (the run was killed between the two renames, or the way back was refused
+  too) makes its month an open one: `geovault compact` puts it back, once the lock
+  file of a killed run is deleted.
+- `Writer.flush` emptied its buffer before it wrote. A part that could not be written
+  (disk full) raised, but its tiles were gone, and the Writer went on believing they
+  were stored, so the same tile added again in that run was dropped. Now the other
+  months of the flush are still written, the rows that are not on disk go back into
+  the buffer for the next flush, and the first error is raised. While the cause
+  lasts every `add` that triggers a flush raises again and the buffer keeps growing:
+  in `geovault ingest` the scenes that add a tile meanwhile are listed as FAILED
+  (exit code 2; their tiles are stored once a flush succeeds), and an error at the
+  close of a chunk ends the run.
+- `s1` and `landsat` name the platform of an acquisition in lower case. Planetary
+  Computer spells the same satellite `SENTINEL-1A` on scenes processed before 2025 and
+  `sentinel-1a` since, also within one orbit (6 of the 1773 overpasses of one store):
+  such an overpass was stored as two acquisitions and its tiles were never merged.
+- Copies of a tile with the same `fetched_at` are resolved by rule at compaction,
+  where the choice was left to chance: the fuller one, then the smaller scene id (as
+  `Writer.add` decides), then the smaller blob (a tile re-encoded by `reencode` next
+  to its old encoding in a part that could not be deleted). `geovault reencode` now
+  says when it left months unsealed, and that message names the likely cause.
+- A failed compaction, `reencode` or part write removes its `.parquet.tmp`, unless
+  that file itself is held open.
+- Not covered: files are not synced to disk before they are renamed, so a power cut
+  (not a killed process) right after a compaction can still cost the month.
+- Tests: `tests/test_store_failures.py`, 19 tests (real handles on a part, on the
+  sealed file with and without sharing; the new file refused its place; a sealed file
+  left aside; copies of one age; flushes failing on a month, before they start and at
+  the rename; a tile added again; a fuller tile arriving meanwhile), and in
+  `tests/test_acquisitions.py` a merged tile left beside one of its scenes and the two
+  spellings of a platform.
+
 ## 0.10.0 (2026-11-17)
 
 Breaking: one store format. A store written before 0.9.0 can no longer be read or

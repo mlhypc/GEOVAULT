@@ -56,8 +56,10 @@ def acquisition(item) -> str:
     """The orbit a scene was taken on: one overpass of one satellite. The scenes of an
     overpass are consecutive slices of it; a morning and an evening pass of the same day
     are two acquisitions. (The orbit number changes at the equator, where the slices on
-    either side come in different CRS and share no tile anyway.)"""
-    return (f"{common.stac_field(item, 'platform')}_"
+    either side come in different CRS and share no tile anyway.) The platform is
+    lower-cased: the catalogue spells it 'SENTINEL-1A' on scenes processed before 2025
+    and 'sentinel-1a' since, and both occur within one orbit."""
+    return (f"{str(common.stac_field(item, 'platform')).lower()}_"
             f"{common.stac_field(item, 'sat:absolute_orbit')}")
 
 

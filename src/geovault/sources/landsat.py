@@ -138,8 +138,9 @@ ACQUISITIONS = True      # tiles carry `acq`; the CLI plans with Writer.existing
 
 def acquisition(item) -> str:
     """The path a scene lies on, per satellite: with the date, one overpass. The scenes
-    of an overpass are consecutive rows of the path and overlap north to south."""
-    return (f"{common.stac_field(item, 'platform')}_"
+    of an overpass are consecutive rows of the path and overlap north to south. The
+    platform is lower-cased, so its spelling in the catalogue cannot split an overpass."""
+    return (f"{str(common.stac_field(item, 'platform')).lower()}_"
             f"{common.stac_field(item, 'landsat:wrs_path')}")
 
 

@@ -125,6 +125,12 @@ def _write_sorted(con, rows_sql: str, path) -> None:
             out.write_table(group, row_group_size=group.num_rows)
 
 
+def _slot(row) -> tuple:
+    """Buffer slot of a row: the tile key, plus the scene for a tile of an acquisition."""
+    key = (row["band"], row["date"], row["acq"], row["crs"], row["x"], row["y"])
+    return key if row["acq"] is None else key + (row["scene_id"],)
+
+
 class Writer:
     """Buffers rows in memory and appends them to the store as new part files.
 
@@ -165,9 +171,6 @@ class Writer:
         so concurrent ingests are deterministic. A better tile for a key that was
         already flushed is appended again; compaction keeps the newest fetched_at,
         which is this one. Returns True when the buffer gained a new row."""
-        key = (band, date, acq, crs, x, y)
-        if acq is not None:
-            key += (scene_id,)
         w, s, e, n = wgs84_bounds
         row = dict(
             band=band, date=date, x=x, y=y, crs=crs, res=float(res), tile_px=tile_px,
@@ -175,6 +178,7 @@ class Writer:
             scene_id=scene_id, data=blob, size_bytes=len(blob), fetched_at=0,
             acq=acq, valid_px=valid_px,
         )
+        key = _slot(row)
         with self._lock:
             # strictly increasing within the process, so "newest fetched_at wins" at compaction
             # means "last added wins" even for tiles added in the same millisecond
@@ -208,7 +212,9 @@ class Writer:
 
     def flush(self) -> dict:
         """Write the buffered rows as new part files (one per (res, month)). Returns
-        {part file: rows} for this flush; nothing is compacted here."""
+        {part file: rows} for this flush; nothing is compacted here. When a part cannot
+        be written the other months are still written, the rows that are not on disk go
+        back into the buffer for the next flush, and the first error is raised."""
         with self._flush_lock:
             with self._lock:
                 rows, self.rows = self.rows, []
@@ -218,43 +224,65 @@ class Writer:
                         self.seen[key] = (None, valid_px, scene_id)
             if not rows:
                 return {}
-            written = self._write_parts(rows)
-            for f, n in written.items():
-                self.written[f] = self.written.get(f, 0) + n
-                if self.log:
-                    self.log(f"  flushed {n} rows ({nbytes / 1e6:.0f} MB) to {f.name}")
+            groups = {}        # one part file per (res, MONTH): the store is partitioned by month,
+            for r in rows:     # a part per date would mean dozens of tiny files per flush
+                groups.setdefault((r["res"], r["date"][:7] + "-01" if r["date"] else ""), []).append(r)
+            written, failure, con = {}, None, None
+            try:
+                con = duckdb.connect()
+                for res, date in list(groups):
+                    try:
+                        f = self._write_part(con, res, date, groups[(res, date)])
+                    except Exception as e:
+                        failure = failure or e
+                        continue
+                    written[f] = len(groups.pop((res, date)))
+                    self.written[f] = written[f]
+                    if self.log:
+                        self.log(f"  flushed {written[f]} rows ({nbytes / 1e6:.0f} MB) to {f.name}")
+            finally:
+                if con is not None:
+                    con.close()
+                self._put_back([r for group in groups.values() for r in group])
+            if failure is not None:
+                raise failure
         return written
 
-    def _write_parts(self, rows) -> dict:
-        by_group = {}          # one part file per (res, MONTH): the store is partitioned by month,
-        for r in rows:         # a part per date would mean dozens of tiny files per flush
-            by_group.setdefault((r["res"], r["date"][:7] + "-01" if r["date"] else ""), []).append(r)
-        written = {}
-        con = duckdb.connect()
-        for (res, date), group in by_group.items():
-            d = month_dir(self.dataset, date)
-            d.mkdir(parents=True, exist_ok=True)
-            f = d / f"r{int(res)}.part-{uuid.uuid4().hex[:8]}.parquet"
-            con.execute(f"CREATE OR REPLACE TABLE buf ({SCHEMA})")
-            con.executemany(
-                f"INSERT INTO buf VALUES ({', '.join('?' for _ in COLS)})",
-                [[r[c] for c in COLS] for r in group],
-            )
-            # Parts get the sealed layout too: a lone part is sealed by a rename. Written
-            # under a temporary name, so a part exists whole or not at all.
-            tmp = f.with_suffix(".parquet.tmp")
-            try:
-                _write_sorted(con, "SELECT * FROM buf", tmp)
-            except BaseException:
-                tmp.unlink(missing_ok=True)
-                raise
+    def _write_part(self, con, res, date, group) -> Path:
+        """One new part file holding `group`, the rows of one (res, month)."""
+        d = month_dir(self.dataset, date)
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"r{int(res)}.part-{uuid.uuid4().hex[:8]}.parquet"
+        con.execute(f"CREATE OR REPLACE TABLE buf ({SCHEMA})")
+        con.executemany(
+            f"INSERT INTO buf VALUES ({', '.join('?' for _ in COLS)})",
+            [[r[c] for c in COLS] for r in group],
+        )
+        # Parts get the sealed layout too: a lone part is sealed by a rename. Written
+        # under a temporary name, so a part exists whole or not at all.
+        tmp = f.with_suffix(".parquet.tmp")
+        try:
+            _write_sorted(con, "SELECT * FROM buf", tmp)
             tmp.replace(f)
-            written[f] = len(group)
-            self.touched.add((res, date))
-            if any(r["acq"] is not None for r in group):
-                self.acq_months.add((res, date))
-        con.close()
-        return written
+        except BaseException:
+            _discard(tmp)
+            raise
+        self.touched.add((res, date))
+        if any(r["acq"] is not None for r in group):
+            self.acq_months.add((res, date))
+        return f
+
+    def _put_back(self, rows) -> None:
+        """Rows a failed flush did not write go back into the buffer. A slot that got a
+        fuller tile while the flush ran keeps that one."""
+        with self._lock:
+            for row in rows:
+                key = _slot(row)
+                idx, valid_px, scene_id = self.seen[key]
+                if idx is None:
+                    self.seen[key] = (len(self.rows), valid_px, scene_id)
+                    self.rows.append(row)
+                    self.buffered_bytes += row["size_bytes"]
 
     def existing_keys(self, res: float, months: list) -> set:
         """(band, date, crs, x, y) already stored for this dataset/res in the given months.
@@ -376,11 +404,16 @@ def _has_split_tiles(files) -> bool:
 
 def _resolved(src: str) -> str:
     """SQL over store rows with re-fetched tiles resolved: one row per tile, or per
-    (tile, scene) for a tile of an acquisition, the newest fetched_at each. Columns are
-    selected by name, so the hive column DuckDB adds for `dataset=` stays out."""
+    (tile, scene) for a tile of an acquisition, the newest fetched_at each. Copies of
+    one age (two processes writing in the same millisecond, a part left beside the month
+    that already holds it) are told apart as Writer.add does it: the fuller one, then
+    the smaller scene id; then the smaller blob, which is a re-encoded tile next to its
+    old encoding. Columns are selected by name, so the hive column DuckDB adds for
+    `dataset=` stays out."""
     cols = ", ".join(COLS)
     return (f"(SELECT {cols} FROM (SELECT {cols}, row_number() OVER (PARTITION BY {KEY}, "
-            f"CASE WHEN acq IS NULL THEN NULL ELSE scene_id END ORDER BY fetched_at DESC) rn "
+            f"CASE WHEN acq IS NULL THEN NULL ELSE scene_id END "
+            f"ORDER BY fetched_at DESC, valid_px DESC NULLS LAST, scene_id, size_bytes) rn "
             f"FROM {src}) WHERE rn = 1)")
 
 
@@ -449,6 +482,71 @@ def _month_rows(con, files, split: bool) -> str:
     return f"SELECT * FROM {_resolved(rest)} UNION ALL SELECT {', '.join(COLS)} FROM merged"
 
 
+def _discard(path) -> None:
+    """Delete a file if that is possible now; one another program holds open stays."""
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        pass
+
+
+def _restore_sealed(target) -> None:
+    """Finish what _seal left when it was killed, or could not move the sealed file
+    back: a sealed file moved aside with nothing in its place is moved back, one whose
+    place was taken is deleted. Runs under the month lock, before the month's files are
+    listed. Until the month is compacted or re-encoded again its sealed file is
+    missing; open_months lists such a month, so `compact` gets to it."""
+    old = target.with_suffix(".parquet.old")
+    if old.exists():
+        if target.exists():
+            _discard(old)
+        else:
+            old.replace(target)
+
+
+def _seal(tmp, target, files) -> None:
+    """Put the finished month file `tmp` in place of the sealed file and delete the
+    parts it replaces. The sealed name never holds part of a month, and no part is
+    deleted before the new file is there, so a file another program holds open costs no
+    rows:
+    - Windows does not rename over a file a reader has open but lets that file be
+      renamed, so the old sealed file is moved aside for the new one (for that instant
+      the month has no sealed file) and moved back when the new one cannot take its
+      place;
+    - a part that cannot be deleted stays an open part. Its rows are in the sealed file
+      too; the next compaction resolves the two copies.
+    Raises when the new file cannot be put in place. The month is then as it was, unless
+    the sealed file could not be moved back either: it stays aside as `.parquet.old`
+    until the next compaction of the month (_restore_sealed)."""
+    try:
+        tmp.replace(target)
+    except PermissionError as e:
+        old = target.with_suffix(".parquet.old")
+        try:
+            # Nothing to gain from moving the sealed file aside when there is none, or
+            # when it is `tmp` that is held: Windows reports that as error 32 (sharing
+            # violation on the source), a held target as error 5.
+            if not target.exists() or getattr(e, "winerror", None) == 32:
+                raise
+            target.replace(old)             # refused when a program holds it without sharing
+        except PermissionError:
+            _discard(tmp)
+            raise
+        try:
+            tmp.replace(target)
+        except BaseException:
+            try:
+                old.replace(target)
+            except OSError:
+                pass
+            _discard(tmp)
+            raise
+        _discard(old)
+    for f in files:
+        if f != target:
+            _discard(f)
+
+
 def compact_month(dataset: str, res: float, date: str, wait: bool = True,
                   only_split: bool = False):
     """Merge a month's sealed file and parts into one file. Rows sharing a key are
@@ -457,7 +555,8 @@ def compact_month(dataset: str, res: float, date: str, wait: bool = True,
     as repair. only_split: do nothing unless the month holds a tile of an acquisition in
     several rows. Returns the sealed file, or None when there was nothing to do. One
     compaction per month at a time (lock file): returns False when another process holds
-    the month (at once with wait=False, else after the lock timeout)."""
+    the month (at once with wait=False, else after the lock timeout). A part another
+    program holds open is not deleted: the month then still has open parts (see _seal)."""
     target = month_dir(dataset, date) / f"r{int(res)}.parquet"
     lock = _MonthLock(target.with_suffix(".parquet.lock"), wait)
     if not lock.acquire():
@@ -469,6 +568,7 @@ def compact_month(dataset: str, res: float, date: str, wait: bool = True,
 
 
 def _compact_month_locked(dataset: str, res: float, date: str, target, only_split: bool = False):
+    _restore_sealed(target)
     files = month_files(dataset, res, date)
     if not files:
         return None
@@ -484,11 +584,14 @@ def _compact_month_locked(dataset: str, res: float, date: str, target, only_spli
         return None
     tmp = target.with_suffix(".parquet.tmp")
     con = duckdb.connect()
-    _write_sorted(con, _month_rows(con, files, split), tmp)
-    con.close()
-    for f in files:
-        f.unlink(missing_ok=True)
-    tmp.replace(target)
+    try:
+        _write_sorted(con, _month_rows(con, files, split), tmp)
+    except BaseException:
+        _discard(tmp)
+        raise
+    finally:
+        con.close()
+    _seal(tmp, target, files)
     return target
 
 
@@ -505,6 +608,7 @@ def reencode_month(dataset: str, res: float, date: str, workers: int = 8, wait: 
     if not lock.acquire():
         return None
     try:
+        _restore_sealed(target)
         files = month_files(dataset, res, date)
         if not files:
             return None
@@ -525,11 +629,14 @@ def reencode_month(dataset: str, res: float, date: str, workers: int = 8, wait: 
         tmp = target.with_suffix(".parquet.tmp")
         con.execute(f"CREATE OR REPLACE TABLE buf ({SCHEMA})")
         con.executemany(f"INSERT INTO buf VALUES ({', '.join('?' for _ in COLS)})", out)
-        _write_sorted(con, "SELECT * FROM buf", tmp)
-        con.close()
-        for f in files:
-            f.unlink(missing_ok=True)
-        tmp.replace(target)
+        try:
+            _write_sorted(con, "SELECT * FROM buf", tmp)
+        except BaseException:
+            _discard(tmp)
+            raise
+        finally:
+            con.close()
+        _seal(tmp, target, files)
         return len(rows), before, after
     finally:
         lock.release()
@@ -556,11 +663,13 @@ def lock_file(dataset: str, res: float, date: str) -> Path:
 
 
 def open_months(dataset: str) -> list:
-    """The (res, date) groups of a dataset that have open part files."""
+    """The (res, date) groups of a dataset a compaction has work for: those with open
+    part files, and those whose sealed file was left aside (see _restore_sealed)."""
     import re
     out = []
-    for f in (STORE / f"dataset={dataset}").rglob("r*.part-*.parquet"):
-        m = re.match(r"r(\d+)\.part-", f.name)
+    root = STORE / f"dataset={dataset}"
+    for f in sorted(root.rglob("r*.part-*.parquet")) + sorted(root.rglob("r*.parquet.old")):
+        m = re.match(r"r(\d+)\.(?:part-|parquet\.old$)", f.name)
         rel = f.parent.relative_to(STORE / f"dataset={dataset}").as_posix()
         key = (float(m.group(1)), "" if rel == "static" else rel.replace("/", "-") + "-01")
         if key not in out:
@@ -569,9 +678,9 @@ def open_months(dataset: str) -> list:
 
 
 def compact(dataset: str) -> list:
-    """Compact every (res, month) of a dataset that has open part files. Returns the
-    groups that are sealed now; one that another process holds locked for longer than
-    the lock timeout stays open (see open_months)."""
+    """Compact every (res, month) of a dataset that open_months lists: those with open
+    part files or a sealed file left aside. Returns the groups that are sealed now; one
+    that another process holds locked for longer than the lock timeout stays open."""
     todo = open_months(dataset)
     for key in todo:
         compact_month(dataset, *key)

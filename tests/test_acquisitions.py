@@ -123,6 +123,27 @@ def test_parts_from_separate_runs_are_merged(vault):
     assert r["valid_px"] == PX * PX and r["scene_id"] == "scene_a|scene_b"
 
 
+def test_a_part_left_beside_its_merged_tile_changes_nothing(vault):
+    """A part another program holds open cannot be deleted by the compaction that merged
+    it: the merged tile then sits next to one of its own scenes until the next one."""
+    w = store.Writer("d")
+    add(w, tile(100, WEST), "scene_a", "orbit_1", cloud=10.0)
+    w.flush()
+    add(w, tile(200, EAST), "scene_b", "orbit_1", cloud=30.0)
+    w.flush()
+    held = store.month_files("d", RES, DATE)[1]
+    with open(held, "rb"):
+        store.compact_month("d", RES, DATE)
+        (merged,) = [r for r in stored() if "|" in r["scene_id"]]
+        assert merged["valid_px"] == PX * PX
+    store.compact_month("d", RES, DATE)
+    (r,) = stored()
+    assert (r["scene_id"], r["valid_px"], r["cloud_pct"]) == (
+        "scene_a|scene_b", PX * PX, merged["cloud_pct"])
+    assert (r["arr"] == merged["arr"]).all()
+    assert store.open_months("d") == []
+
+
 def test_a_third_scene_fills_what_is_left(vault):
     w = store.Writer("d")
     add(w, tile(100, slice(0, 6)), "scene_a", "orbit_1")
@@ -292,7 +313,12 @@ def test_acquisition_names():
         == "GS2C_20260305T081821_007813"
     assert s1_pc.acquisition(item(**{"platform": "sentinel-1a", "sat:absolute_orbit": 63436})) \
         == "sentinel-1a_63436"
+    # the catalogue spells the satellite in two ways, also within one orbit
+    assert s1_pc.acquisition(item(**{"platform": "SENTINEL-1A", "sat:absolute_orbit": 57253})) \
+        == s1_pc.acquisition(item(**{"platform": "sentinel-1a", "sat:absolute_orbit": 57253}))
     assert landsat.acquisition(item(**{"platform": "landsat-9", "landsat:wrs_path": "175"})) \
+        == "landsat-9_175"
+    assert landsat.acquisition(item(**{"platform": "LANDSAT-9", "landsat:wrs_path": "175"})) \
         == "landsat-9_175"
     with pytest.raises(ValueError, match="s2:datatake_id"):
         s2_earthsearch.acquisition(item(platform="sentinel-2a"))
