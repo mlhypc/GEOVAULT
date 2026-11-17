@@ -7,8 +7,9 @@ part files; a month is sealed into a single file by compaction. The logical key 
 satellite, within the date) for sources that can image the same ground twice a day,
 and is NULL for all others. Compaction resolves rows that share a key: scenes of one acquisition
 that each hold part of a tile are merged into one tile; anything else is a re-fetch
-and the newest fetched_at wins. Rows are sorted (band, date, x, y) so DuckDB
-row-group statistics prune reads.
+and the newest fetched_at wins. Rows are sorted (band, date, x, y) and cut into
+small row groups (about GROUP_BYTES of tiles each), so a read that names a band, a
+date or a tile fetches the few groups their min/max statistics leave.
 
 Layout:
   data/store/dataset=<d>/<YYYY>/<MM>/r<res>.parquet          (sealed month)
@@ -24,10 +25,12 @@ import os
 import threading
 import time
 import uuid
-from functools import lru_cache
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 ROOT = Path(os.environ.get("GEOVAULT_DATA", Path(__file__).resolve().parents[2] / "data"))
 STORE = ROOT / "store"
@@ -55,8 +58,17 @@ COLS = ["band", "date", "x", "y", "crs", "res", "tile_px",
         "scene_id", "data", "size_bytes", "fetched_at", "acq", "valid_px"]
 KEY = "band, date, acq, crs, x, y"
 
-# Columns added in 0.9.0. Files written before it do not have them.
-ADDED_COLS = {"acq": "VARCHAR", "valid_px": "INTEGER"}
+# A row group ends once it holds this many bytes of tiles, or this many tiles. A reader
+# fetches whole groups: with one tile of interest in a group of 2048 (the smallest
+# group DuckDB's writer makes) a 211 KB tile cost 112 ms to read, in a 4 MB group 5 ms.
+# Smaller groups cost more than they save: the footer, read on every query, grows.
+GROUP_BYTES = 4_000_000
+GROUP_ROWS = 2048
+
+# The columns rows are found by carry min/max statistics per row group. Not the tile
+# bytes, and not nodata or cloud_pct: pyarrow leaves NaN out of a column's min/max and
+# DuckDB then skips a group whose only match is a NaN.
+STAT_COLS = ["band", "date", "x", "y", "crs", "acq", "scene_id", "west", "south", "east", "north"]
 
 # A month is auto-compacted at close() once it spans more than this many files.
 # Ingest stays a cheap append (new part file); compaction is maintenance.
@@ -74,29 +86,43 @@ def month_files(dataset: str, res: float, date: str) -> list:
     return sorted(d.glob(f"r{int(res)}.parquet")) + sorted(d.glob(f"r{int(res)}.part-*.parquet"))
 
 
-@lru_cache(maxsize=1024)
-def _columns(paths: tuple, stamps: tuple) -> frozenset:
-    """Column names over a list of store files (one footer scan; cached per list and
-    modification times, since a reader asks again for every tile of a file)."""
-    lst = ", ".join(f"'{p}'" for p in paths)
-    con = duckdb.connect()
-    cols = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet([{lst}], union_by_name=true)").fetchall()
-    con.close()
-    return frozenset(c[0] for c in cols)
-
-
 def scan(files, filename: bool = False) -> str:
-    """SQL source over store files that has every column of SCHEMA: the columns a file
-    written by an older version lacks read as NULL. Selecting a column by name from
-    read_parquet fails when none of the files has it, so every query that names store
-    columns goes through here."""
-    paths = tuple(Path(f).as_posix() for f in files)
-    have = _columns(paths, tuple(os.stat(p).st_mtime_ns for p in paths))
-    lst = ", ".join(f"'{p}'" for p in paths)
-    src = f"read_parquet([{lst}], union_by_name=true{', filename=true' if filename else ''})"
-    missing = [f"NULL::{t} AS {c}" for c, t in ADDED_COLS.items() if c not in have]
-    return f"(SELECT *, {', '.join(missing)} FROM {src})" if missing else src
+    """SQL source over a list of store files; filename: add the path of each row's file."""
+    lst = ", ".join(f"'{Path(f).as_posix()}'" for f in files)
+    return f"read_parquet([{lst}]{', filename=true' if filename else ''})"
+
+
+def _row_groups(batches):
+    """Cut a stream of record batches into tables of about GROUP_BYTES of tiles, at
+    most GROUP_ROWS rows each: the row groups of a store file."""
+    held, rows, size = [], 0, 0
+    for batch in batches:
+        start = 0
+        for end, nbytes in enumerate(pc.binary_length(batch.column("data")).to_pylist(), 1):
+            rows += 1
+            size += nbytes or 0
+            if size >= GROUP_BYTES or rows >= GROUP_ROWS:
+                yield pa.Table.from_batches(held + [batch.slice(start, end - start)])
+                held, rows, size, start = [], 0, 0, end
+        if start < batch.num_rows:
+            held.append(batch.slice(start))
+    if held:
+        yield pa.Table.from_batches(held)
+
+
+def _write_sorted(con, rows_sql: str, path) -> None:
+    """Write the rows of a query as one store file: sorted (band, date, x, y), ZSTD,
+    in row groups sized by _row_groups. pyarrow writes the file because DuckDB's COPY
+    cannot make a row group smaller than 2048 rows. Statistics go on STAT_COLS only and
+    the tile bytes are not dictionary encoded. A write that fails leaves a file holding
+    the groups written so far, so callers write to a temporary name and rename."""
+    reader = con.execute(
+        f"SELECT * FROM ({rows_sql}) ORDER BY band, date, x, y").to_arrow_reader(256)
+    with pq.ParquetWriter(path, reader.schema, compression="zstd", compression_level=3,
+                          write_statistics=STAT_COLS,
+                          use_dictionary=[c for c in COLS if c != "data"]) as out:
+        for group in _row_groups(reader):
+            out.write_table(group, row_group_size=group.num_rows)
 
 
 class Writer:
@@ -214,12 +240,15 @@ class Writer:
                 f"INSERT INTO buf VALUES ({', '.join('?' for _ in COLS)})",
                 [[r[c] for c in COLS] for r in group],
             )
-            # Small row groups (256 tiles, ~12 MB of blobs) over a band/x/y sort: a reader asking for one
-            # band and a bbox touches a few row groups via their min/max stats instead of decompressing
-            # the whole file. With one row group per file a 900 MB static layer cost 0.5 s per map tile.
-            con.execute(
-                f"COPY (SELECT * FROM buf ORDER BY band, date, x, y) "
-                f"TO '{f.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 256)")
+            # Parts get the sealed layout too: a lone part is sealed by a rename. Written
+            # under a temporary name, so a part exists whole or not at all.
+            tmp = f.with_suffix(".parquet.tmp")
+            try:
+                _write_sorted(con, "SELECT * FROM buf", tmp)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+            tmp.replace(f)
             written[f] = len(group)
             self.touched.add((res, date))
             if any(r["acq"] is not None for r in group):
@@ -348,7 +377,7 @@ def _has_split_tiles(files) -> bool:
 def _resolved(src: str) -> str:
     """SQL over store rows with re-fetched tiles resolved: one row per tile, or per
     (tile, scene) for a tile of an acquisition, the newest fetched_at each. Columns are
-    selected explicitly so stray helper columns in old files never break a merge."""
+    selected by name, so the hive column DuckDB adds for `dataset=` stays out."""
     cols = ", ".join(COLS)
     return (f"(SELECT {cols} FROM (SELECT {cols}, row_number() OVER (PARTITION BY {KEY}, "
             f"CASE WHEN acq IS NULL THEN NULL ELSE scene_id END ORDER BY fetched_at DESC) rn "
@@ -455,9 +484,7 @@ def _compact_month_locked(dataset: str, res: float, date: str, target, only_spli
         return None
     tmp = target.with_suffix(".parquet.tmp")
     con = duckdb.connect()
-    con.execute(
-        f"COPY (SELECT * FROM ({_month_rows(con, files, split)}) ORDER BY band, date, x, y) "
-        f"TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 256)")
+    _write_sorted(con, _month_rows(con, files, split), tmp)
     con.close()
     for f in files:
         f.unlink(missing_ok=True)
@@ -498,9 +525,7 @@ def reencode_month(dataset: str, res: float, date: str, workers: int = 8, wait: 
         tmp = target.with_suffix(".parquet.tmp")
         con.execute(f"CREATE OR REPLACE TABLE buf ({SCHEMA})")
         con.executemany(f"INSERT INTO buf VALUES ({', '.join('?' for _ in COLS)})", out)
-        con.execute(
-            f"COPY (SELECT * FROM buf ORDER BY band, date, x, y) "
-            f"TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 256)")
+        _write_sorted(con, "SELECT * FROM buf", tmp)
         con.close()
         for f in files:
             f.unlink(missing_ok=True)
@@ -508,18 +533,6 @@ def reencode_month(dataset: str, res: float, date: str, workers: int = 8, wait: 
         return len(rows), before, after
     finally:
         lock.release()
-
-
-def has_rows_without_acq(dataset: str) -> bool:
-    """True when the dataset holds a tile without an acquisition: for a source that
-    names acquisitions, a store written before it did."""
-    files = sorted((STORE / f"dataset={dataset}").rglob("r*.parquet"))
-    if not files:
-        return False
-    con = duckdb.connect()
-    hit = con.execute(f"SELECT 1 FROM {scan(files)} WHERE acq IS NULL LIMIT 1").fetchone()
-    con.close()
-    return hit is not None
 
 
 def months(dataset: str) -> list:

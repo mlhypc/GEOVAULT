@@ -1,5 +1,5 @@
 """Offline tests for reader.series on edge cases of the catalog: the same tile numbers in two
-UTM zones, catalogs built before the crs column existed, and a stale catalog."""
+UTM zones, and a stale catalog."""
 
 import os
 
@@ -47,12 +47,6 @@ def values(rows):
 def test_series_keeps_both_zones(two_zones):
     assert values(reader.series("edge", *POINT, "b")) == [
         ("2026-01-01", 35), ("2026-01-01", 36), ("2026-01-02", 35), ("2026-01-02", 36)]
-
-
-def test_series_on_a_catalog_without_crs_takes_each_zone_once(two_zones):
-    _rewrite(two_zones, "SELECT * EXCLUDE (crs)")
-    got = sorted(values(reader.series("edge", *POINT, "b")))
-    assert got == [("2026-01-01", 35), ("2026-01-01", 36), ("2026-01-02", 35), ("2026-01-02", 36)]
 
 
 def test_series_on_a_stale_catalog_raises(two_zones):

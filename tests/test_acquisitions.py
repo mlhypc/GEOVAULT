@@ -2,7 +2,7 @@
 
 Two overpasses on one day (Sentinel-1 morning and evening, Sentinel-2A and 2B) are two
 tiles, not one. Two scenes of one overpass that each hold part of a tile are merged into
-one tile. Files written before the `acq` and `valid_px` columns existed stay readable."""
+one tile."""
 
 import io
 from pathlib import Path
@@ -237,56 +237,6 @@ def test_compact_reports_only_what_it_sealed(vault):
     assert store.compact("d") == [(float(RES), DATE[:7] + "-01")] and store.open_months("d") == []
 
 
-# --- files written before 0.9.0 have neither `acq` nor `valid_px` ---------------------------
-
-OLD_SCHEMA = """band VARCHAR, date VARCHAR, x BIGINT, y BIGINT, crs VARCHAR, res DOUBLE,
-    tile_px INTEGER, west DOUBLE, south DOUBLE, east DOUBLE, north DOUBLE, nodata DOUBLE,
-    cloud_pct DOUBLE, scene_id VARCHAR, data BLOB, size_bytes BIGINT, fetched_at BIGINT"""
-
-
-def write_old_part(dataset, name, rows):
-    """A part file as 0.8.0 wrote it. rows: (x, value, fetched_at)."""
-    d = store.month_dir(dataset, DATE)
-    d.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect()
-    con.execute(f"CREATE TABLE t ({OLD_SCHEMA})")
-    for x, value, fetched_at in rows:
-        blob = encode_blob(tile(value), CRS, Affine(RES, 0, X0 + x * RES * PX, 0, -RES, Y1), 0)
-        con.execute("INSERT INTO t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ["b", DATE, x, 0, CRS, float(RES), PX, *BOUNDS, 0.0, None, "old", blob,
-                     len(blob), fetched_at])
-    con.execute(f"COPY t TO '{(d / name).as_posix()}' (FORMAT PARQUET)")
-    con.close()
-
-
-def test_a_store_written_before_the_new_columns_still_works(vault):
-    write_old_part("old", f"r{RES}.part-aaaaaaaa.parquet", [(0, 100, 1), (1, 100, 1)])
-    write_old_part("old", f"r{RES}.part-bbbbbbbb.parquet", [(1, 200, 2)])
-    w = store.Writer("old")
-    assert w.existing_keys(RES, [DATE[:7]]) == {("b", DATE, CRS, 0, 0), ("b", DATE, CRS, 1, 0)}
-    assert catalog.rebuild("old") == 3
-    assert store.has_rows_without_acq("old")
-    store.compact("old")                                      # newest fetched_at wins
-    rows = stored("old")
-    assert [(r["x"], int(r["arr"][0, 0]), r["acq"], r["valid_px"]) for r in rows] == [
-        (0, 100, None, None), (1, 200, None, None)]
-    assert catalog.rebuild("old") == 2
-    cat = reader.tiles_for_bbox("old", (32.0, 36.0, 34.0, 38.0), "b")
-    assert [int(reader.read_tile(r)[0][0, 0]) for r in cat] == [100, 200]
-
-
-def test_old_and_new_files_of_one_month_compact_together(vault):
-    write_old_part("mix", f"r{RES}.parquet", [(0, 100, 1), (1, 100, 1)])
-    w = store.Writer("mix")
-    add(w, tile(300), "new", None, x=1)
-    add(w, tile(300), "new", None, x=2)
-    w.close()
-    store.compact("mix")
-    rows = stored("mix")
-    assert [(r["x"], int(r["arr"][0, 0]), r["valid_px"]) for r in rows] == [
-        (0, 100, None), (1, 300, PX * PX), (2, 300, PX * PX)]
-
-
 # --- what a scene still has to fetch ----------------------------------------------------------
 
 from types import SimpleNamespace
@@ -412,40 +362,6 @@ def test_existing_scenes_tells_full_tiles_from_partial_ones(vault):
         ("b", DATE, "orbit_1", CRS, 1, 0): frozenset({"scene_a", "scene_b"})}
 
 
-def test_ingest_refuses_a_store_written_before_acquisitions(vault, monkeypatch, capsys):
-    from geovault import cli
-    write_old_part("s1", f"r{RES}.parquet", [(0, 100, 1)])
-    monkeypatch.setattr(s1_pc, "search", lambda *a, **k: pytest.fail("searched"))
-    args = ["ingest", "--dataset", "s1", "--bbox", "36.3", "37.0", "36.34", "37.03",
-            "--start", "2026-03-01", "--end", "2026-03-02"]
-    for extra in ([], ["--dry-run"]):
-        assert cli.main(args + extra) == 3
-        err = capsys.readouterr().err
-        assert "before 0.9.0" in err and "dataset=s1" in err and "s1.parquet" in err
-    assert not (vault / "logs").exists()
-
-
-def test_lacks_acquisitions(vault):
-    assert not catalog.lacks_acquisitions("none")              # nothing stored
-    write_old_part("old", f"r{RES}.parquet", [(0, 100, 1)])
-    assert catalog.lacks_acquisitions("old")                   # no catalog: asked of the store
-    catalog.rebuild("old")
-    assert catalog.lacks_acquisitions("old")                   # a catalog whose acq is NULL
-    con = duckdb.connect()                                     # a catalog as 0.8.0 wrote it
-    con.execute(f"COPY (SELECT * EXCLUDE (acq, valid_px) FROM read_parquet("
-                f"'{catalog.path('old').as_posix()}')) TO '{catalog.path('old').as_posix()}.tmp' "
-                f"(FORMAT PARQUET)")
-    con.close()
-    Path(str(catalog.path("old")) + ".tmp").replace(catalog.path("old"))
-    assert catalog.lacks_acquisitions("old")
-    w = store.Writer("new")
-    add(w, tile(100), "scene_a", "orbit_1")
-    w.close()
-    assert not catalog.lacks_acquisitions("new")
-    catalog.rebuild("new")
-    assert not catalog.lacks_acquisitions("new")
-
-
 # --- reading a date that holds two acquisitions ------------------------------------------------
 
 from pyproj import Transformer
@@ -494,6 +410,13 @@ def test_read_tile_reads_the_acquisition_of_its_row(two_passes):
     rows = reader.tiles_for_bbox("g", TILE, "b", DATE)
     assert [(r["acq"], int(reader.read_tile(r)[0][0, 15])) for r in rows] == [
         ("orbit_1", 100), ("orbit_2", 200)]
+
+
+def test_read_tile_matches_a_row_whose_scene_is_not_named(vault):
+    geo_store([(tile(100), None, "orbit_1", DATE)])
+    (row,) = reader.tiles_for_bbox("g", TILE, "b", DATE)
+    assert row["scene_id"] is None and (reader.read_tile(row)[0] == 100).all()
+    assert (reader.mosaic("g", TILE, "b", DATE)[0] == 100).all()
 
 
 def test_mosaic_takes_one_acquisition_and_says_so(two_passes):
@@ -572,22 +495,6 @@ def test_scenes_not_merged_yet_are_read_one_by_one(vault, recwarn):
     lon, lat = TO_WGS.transform(X0 + 5, Y1 - 5)                  # column 0: scene_a only
     assert [(r["scene_id"], r["value"]) for r in reader.series("g", lon, lat, "b")] == [
         ("scene_a", 100)]
-
-
-def test_a_catalog_built_before_acquisitions_still_reads(vault, recwarn):
-    write_old_part("old", f"r{RES}.parquet", [(0, 100, 1)])
-    catalog.rebuild("old")
-    con = duckdb.connect()                                     # the catalog as 0.8.0 wrote it
-    cat = catalog.path("old")
-    con.execute(f"COPY (SELECT * EXCLUDE (acq, valid_px) FROM read_parquet('{cat.as_posix()}')) "
-                f"TO '{cat.as_posix()}.tmp' (FORMAT PARQUET)")
-    con.close()
-    Path(str(cat) + ".tmp").replace(cat)
-    (row,) = reader.tiles_for_bbox("old", (32.0, 36.0, 34.0, 38.0), "b")
-    assert "acq" not in row and (reader.read_tile(row)[0] == 100).all()
-    arr, _, _ = reader.mosaic("old", (32.0, 36.0, 34.0, 38.0), "b", DATE)
-    assert (arr == 100).all() and reader.acquisitions("old", (32.0, 36.0, 34.0, 38.0), "b", DATE) == []
-    assert len(recwarn) == 0
 
 
 def test_series_gives_one_record_per_acquisition(two_passes):

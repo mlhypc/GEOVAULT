@@ -36,9 +36,8 @@ def tiles_for_bbox(dataset, bbox, band=None, date=None) -> list:
     if date:
         where.append(f"date LIKE '{date}%'")
     con = duckdb.connect()
-    # crs is in catalogs built by 0.5.0 and later; older catalogs yield NULL until rebuilt
     cur = con.execute(
-        f"SELECT * FROM read_parquet('{p.as_posix()}', union_by_name=true) "
+        f"SELECT * FROM read_parquet('{p.as_posix()}') "
         f"WHERE {' AND '.join(where)} ORDER BY band, date, x, y")
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -51,27 +50,20 @@ def read_tile(row):
     The CRS and the acquisition are part of the tile key: UTM tile numbers restart in
     every zone, so the same (x, y) can be stored twice in one file, for ground in two
     zones, and a date can hold the same tile from two overpasses."""
-    # every column is selected and the acquisition matched here, not in SQL: a file
-    # written before 0.9.0 has no acq column to name
-    sql = (f"SELECT * FROM read_parquet('{Path(row['file']).as_posix()}', union_by_name=true) "
-           f"WHERE band=? AND date=? AND x=? AND y=?")
-    args = [row["band"], row["date"], row["x"], row["y"]]
-    if row.get("crs") is not None:
-        sql += " AND crs=?"
-        args.append(row["crs"])
+    sql = (f"SELECT data FROM read_parquet('{Path(row['file']).as_posix()}') "
+           f"WHERE band=? AND date=? AND x=? AND y=? "
+           f"AND crs IS NOT DISTINCT FROM ? AND acq IS NOT DISTINCT FROM ?")
+    args = [row["band"], row["date"], row["x"], row["y"], row["crs"], row["acq"]]
+    if row["acq"] is not None:          # until a month is compacted, one row per scene
+        sql += " AND scene_id IS NOT DISTINCT FROM ?"
+        args.append(row["scene_id"])
     with duckdb.connect() as con:
-        cur = con.execute(sql, args)
-        cols = [d[0] for d in cur.description]
-        found = [dict(zip(cols, r)) for r in cur.fetchall()]
-    if "acq" in row:                    # catalogs built before 0.9.0 have no acq column
-        found = [f for f in found if f.get("acq") == row["acq"]]
-        if row["acq"] is not None:      # until a month is compacted, one row per scene
-            found = [f for f in found if f["scene_id"] == row["scene_id"]]
+        found = con.execute(sql, args).fetchall()
     if len(found) != 1:
         raise RuntimeError(f"catalog row matches {len(found)} stored tiles in {row['file']} "
                            f"(band {row['band']} date {row['date']} x {row['x']} y {row['y']}): "
                            f"rebuild the catalog")
-    return _decode(found[0]["data"])
+    return _decode(found[0][0])
 
 
 def _needs_nodata(band, nodata):
@@ -220,7 +212,7 @@ def _mosaic(dataset, bbox, band, date, masked, within=None, acq=None):
     exact = [r for r in tiles_for_bbox(dataset, bbox, band, date) if r["date"] == date]
     rows = exact or tiles_for_bbox(dataset, bbox, band, date)
     if acq is not None:
-        rows = [r for r in rows if r.get("acq") == acq]
+        rows = [r for r in rows if r["acq"] == acq]
     if not rows:
         return None
     tiles = [(r, *read_tile(r)) for r in rows]
@@ -231,12 +223,12 @@ def _mosaic(dataset, bbox, band, date, masked, within=None, acq=None):
     # an acquisition whose tiles reach the request without an observation on it does not
     # count. Tiles without an acquisition (None) are a group of their own.
     order = lambda n: (n is None, n or "")
-    names = sorted({r.get("acq") for r in rows}, key=order)
+    names = sorted({r["acq"] for r in rows}, key=order)
     if exact and acq is None and len(names) > 1:
         lon, lat = _request_points(bbox, within, rows[0])
         made, cover = {}, {}
         for name in names:
-            made[name] = _compose([t for t in tiles if t[0].get("acq") == name], bbox, band, masked)
+            made[name] = _compose([t for t in tiles if t[0]["acq"] == name], bbox, band, masked)
             cover[name] = int(_seen_at(made[name][1], made[name][3], made[name][4], lon, lat).sum())
         seen = [n for n in names if cover[n]] or names[:1]
         best = min(seen, key=lambda n: (-cover[n], order(n)))
@@ -267,7 +259,7 @@ def acquisitions(dataset, bbox, band, date) -> list:
     Empty when nothing is stored there, and for sources whose tiles carry no
     acquisition."""
     rows = tiles_for_bbox(dataset, bbox, band, date)
-    return sorted({r["acq"] for r in rows if r["date"] == date and r.get("acq") is not None})
+    return sorted({r["acq"] for r in rows if r["date"] == date and r["acq"] is not None})
 
 
 def _masked(arr, observed, nodata):
@@ -314,10 +306,7 @@ def _blobs_by_row(rows):
     yielded file by file, so memory holds one batch at a time, not the whole series.
 
     A row the catalog names but its file no longer holds raises, as read_tile does: the
-    catalog is stale and must be rebuilt. Catalogs built before 0.5.0 have no crs column;
-    their rows match a stored tile on (band, date, x, y), and when one file holds the same
-    tile numbers in two UTM zones each catalog row takes a different stored tile. The same
-    holds for the acquisition and catalogs built before 0.9.0."""
+    catalog is stale and must be rebuilt."""
     by_file = {}
     for i, r in enumerate(rows):
         by_file.setdefault(r["file"], []).append(i)
@@ -326,27 +315,21 @@ def _blobs_by_row(rows):
             want = {}
             for i in idx:
                 r = rows[i]
-                scene = r["scene_id"] if r.get("acq") is not None else None
-                want.setdefault((r["band"], r["date"], r["x"], r["y"], r.get("crs"), r.get("acq"),
+                scene = r["scene_id"] if r["acq"] is not None else None
+                want.setdefault((r["band"], r["date"], r["x"], r["y"], r["crs"], r["acq"],
                                  scene), []).append(i)
             sub = [rows[i] for i in idx]
             dates = [r["date"] for r in sub]
-            # every column, not a list of names: a file written before 0.9.0 has no acq
             cur = con.execute(
-                f"SELECT * FROM read_parquet('{Path(f).as_posix()}', union_by_name=true) "
+                f"SELECT band, date, x, y, crs, acq, scene_id, data "
+                f"FROM read_parquet('{Path(f).as_posix()}') "
                 f"WHERE band IN (SELECT unnest(?)) AND date BETWEEN ? AND ? "
                 f"AND x IN (SELECT unnest(?)) AND y IN (SELECT unnest(?))",
                 [sorted({r["band"] for r in sub}), min(dates), max(dates),
                  sorted({r["x"] for r in sub}), sorted({r["y"] for r in sub})])
-            at = {c[0]: n for n, c in enumerate(cur.description)}
             while batch := cur.fetchmany(256):
-                for rec in batch:
-                    band, d, x, y, crs, scene, data = (rec[at[c]] for c in (
-                        "band", "date", "x", "y", "crs", "scene_id", "data"))
-                    acq = rec[at["acq"]] if "acq" in at else None
-                    k = (band, d, x, y)
-                    hits = (want.get(k + (crs, acq, scene if acq is not None else None))
-                            or want.get(k + (crs, None, None)) or want.get(k + (None, None, None)))
+                for band, d, x, y, crs, acq, scene, data in batch:
+                    hits = want.get((band, d, x, y, crs, acq, scene if acq is not None else None))
                     if hits:
                         yield hits.pop(), data
             left = [rows[i] for v in want.values() for i in v]
@@ -396,7 +379,7 @@ def series(dataset, lon, lat, band, date=None):
             continue
         out.append({"date": r["date"], "value": v.item(),
                     "cloud_pct": r["cloud_pct"], "scene_id": r["scene_id"], "crs": crs,
-                    "acq": r.get("acq")})
+                    "acq": r["acq"]})
     out.sort(key=lambda d: (d["date"], d["acq"] or "", d["crs"]))
     return out
 

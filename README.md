@@ -29,7 +29,9 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2025-07-14")
    Earth's BulkMetadata design.)
 2. **Few big immutable files.** One Parquet per (dataset, month, resolution
    group); each row is a tile, pixels stored as a DEFLATE GeoTIFF blob. Rows are
-   sorted (band, date, x, y) so DuckDB row-group statistics prune reads. Float tiles
+   sorted (band, date, x, y) and cut into row groups of about 4 MB of tiles, so a
+   read that names a band, a date or a tile fetches only the groups their min/max
+   statistics leave (see [File layout](#file-layout-row-groups)). Float tiles
    are encoded with both TIFF predictors (2 horizontal, 3 floating-point) and the
    smaller blob kept; see [Blob encoding](#blob-encoding).
 3. **Zero remote compute.** STAC search plus HTTP range reads from public COGs.
@@ -496,8 +498,7 @@ command; it fetches only the tiles that are still missing.
 Failures are per scene, not per run: a scene whose fetch raises is reported as
 `FAILED`, the other scenes of its chunk are still written, the failed ids are
 listed at the end and the exit code is 2. Re-running the same command retries
-exactly those scenes. (Exit code 3: the dataset was stored before 0.9.0 and has to
-be ingested anew, see [Acquisitions](#acquisitions-two-overpasses-on-one-day).) A native crash inside GDAL cannot be caught this way (the
+exactly those scenes. A native crash inside GDAL cannot be caught this way (the
 process dies with no traceback), which is why coverage should be verified from
 the catalog, not from the exit code: `--dry-run` with the ingest's own arguments
 prints, per scene, how many tiles are not in the store yet and exits 0 only when
@@ -605,14 +606,14 @@ data/
   store/dataset=<d>/<YYYY>/<MM>/r<res>.parquet    sealed month
   store/dataset=<d>/<YYYY>/<MM>/r<res>.part-*.parquet  open parts (hot month)
   store/dataset=<d>/static/r<res>.parquet         static layers
+  store/dataset=<d>/**/*.parquet.tmp              a write in progress; one left by a killed run is never read, delete it
   cache/<dataset>/<archive folder>/               downloaded source objects (PARDIG archives); delete when no ingest runs
   logs/<dataset>_<timestamp>.log                  one log per ingest run
 ```
 
 Row schema: `band, date, x, y, crs, res, tile_px, west/south/east/north (WGS84),
 nodata, cloud_pct, scene_id, data (GeoTIFF blob), size_bytes, fetched_at, acq,
-valid_px`. `valid_px` is the number of pixels holding an observation; `acq` and
-`valid_px` are absent from files written before 0.9.0 and read as NULL.
+valid_px`. `valid_px` is the number of pixels holding an observation.
 Logical key: `(dataset, band, date, acq, crs, x, y)`. The CRS is part of the key because
 UTM tile numbers restart in every zone: the same `(x, y)` in zones 35 and 36 is ground
 six degrees apart. `acq` is part of it because a satellite can image the same ground
@@ -666,12 +667,6 @@ composites the overpasses of one day; read each and combine them as the data all
 A date prefix (`"2026-03"`) remains a composite over everything it matches, and
 `acq=` then narrows it to the acquisitions of that name.
 
-Upgrading: a `s2`, `s1` or `landsat` store written before 0.9.0 has no acquisitions.
-It can still be read, with the old behaviour, but `geovault ingest` (also with
-`--dry-run`) stops with exit code 3 instead of mixing old and new tiles. To ingest,
-delete `data/store/dataset=<name>/` and `data/catalog/<name>.parquet` (under
-`GEOVAULT_DATA` when that is set) and ingest again. All other datasets are untouched.
-
 ### Write pattern (hot month)
 
 Ingest is a cheap append: each flush writes a new `r<res>.part-<id>.parquet` and
@@ -689,6 +684,43 @@ readers see those rows. `Writer.close()` merges the months written since the las
 merge; after `close(merge=False)`, or when another process held the month, call
 `store.compact(dataset)`. When an ingest could not seal a month it says so and names
 the command.
+
+### File layout (row groups)
+
+A month file is sorted (band, date, x, y) and cut into row groups: a group ends once
+it holds 4 MB of tiles, or 2048 tiles. Every group carries the min/max of its key
+columns and a reader fetches a group whole, so the size of a group is what one tile
+costs to read. Measured on one month file per dataset, one tile read through DuckDB,
+with the file as DuckDB's own writer cuts it (no group under 2048 tiles, so these
+month files are one to six groups) and with groups of 4 MB:
+
+| dataset | tile | DuckDB writer | 4 MB |
+|---|---|---|---|
+| `s1` | 211 KB | 112 ms | 5 ms |
+| `glo30` | 163 KB | 55 ms | 5 ms |
+| `s2` | 92 KB | 88 ms | 6 ms |
+| `landsat` | 78 KB | 19 ms | 4 ms |
+| `modis_vi` | 39 KB | 40 ms | 5 ms |
+| `modis_lst` | 24 KB | 29 ms | 6 ms |
+| `agera5` | 22 KB | 27 ms | 5 ms |
+| `pardig_nrt` | 1.6 KB | 4 ms | 3 ms (2048 tiles are 3 MB: same layout) |
+
+Smaller is not better: the footer lists every group and is read on every query. The
+same `s2` month at other targets:
+
+| group | groups | one tile | listing its keys |
+|---|---|---|---|
+| 0.5 MB | 532 | 14.5 ms | 78 ms |
+| 2 MB | 144 | 6.2 ms | 19 ms |
+| 4 MB | 73 | 5.6 ms | 11 ms |
+| 16 MB | 19 | 10.8 ms | 4 ms |
+
+Listing keys is what a catalog rebuild and the skip set of an ingest do, so those
+pay for the layout: the catalog query over 171 `s2` month files takes 0.9 s instead
+of 0.2 s. Either way the file size differs by less than 1%. The files are written with pyarrow, because DuckDB's `COPY` cannot
+write a group smaller than 2048 rows. Min/max statistics are kept for the key
+columns, `scene_id` and the bounds; `nodata` and `cloud_pct` have none, since a NaN
+is left out of them and a filter on such a column would then skip its group.
 
 ### Blob encoding
 

@@ -44,23 +44,6 @@ def rebuild(dataset: str) -> int:
     return n
 
 
-def lacks_acquisitions(dataset: str) -> bool:
-    """True when the dataset holds tiles that do not name their acquisition: for a source
-    whose tiles do, a store written before 0.9.0. Answered from the catalog; when there
-    is none (a first ingest, or a crash before the first rebuild) from the store."""
-    p = path(dataset)
-    if not p.exists():
-        from .store import has_rows_without_acq
-        return has_rows_without_acq(dataset)
-    con = duckdb.connect()
-    src = f"read_parquet('{p.as_posix()}')"
-    cols = {c[0] for c in con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()}
-    where = "WHERE acq IS NULL" if "acq" in cols else ""
-    hit = con.execute(f"SELECT 1 FROM {src} {where} LIMIT 1").fetchone()
-    con.close()
-    return hit is not None
-
-
 def coverage(dataset: str, bbox=None, date=None) -> list:
     """(date, band, tile count, mean cloud) summary; bbox = (w, s, e, n) in WGS84."""
     p = path(dataset)

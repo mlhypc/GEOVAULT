@@ -46,21 +46,12 @@ def _report_open(dataset, say) -> None:
     locks = [_store.lock_file(dataset, res, date) for res, date in left]
     locks = [str(f) for f in locks if f.exists()]
     if locks:
-        say(f"  another process is compacting them, or a crash left these lock files behind: "
+        say("  another process is compacting them, or a crash left these lock files behind: "
             + ", ".join(locks))
         say(f"  when no geovault process is running, delete the lock files and run "
             f"`geovault compact {dataset}`")
     else:
         say(f"  run `geovault compact {dataset}`")
-
-
-def _refuse_old_store(dataset) -> int:
-    """Exit code 3: the dataset was stored before tiles named their acquisition."""
-    print(f"geovault: the {dataset} store was written before 0.9.0. Its tiles do not name "
-          f"their acquisition and cannot be mixed with new ones, so nothing was fetched or "
-          f"checked. It can still be read. To ingest, delete {_store.STORE / ('dataset=' + dataset)} "
-          f"and {catalog.path(dataset)}, then ingest again.", file=sys.stderr)
-    return 3
 
 
 def main(argv=None):
@@ -156,8 +147,6 @@ def main(argv=None):
     # ingest
     src = REGISTRY[a.dataset]
     acquisitions = getattr(src, "ACQUISITIONS", False)
-    if acquisitions and catalog.lacks_acquisitions(a.dataset):
-        return _refuse_old_store(a.dataset)
     from .log import setup as _setup_log, Progress
     log = _setup_log(a.dataset)
     aoi = None
@@ -227,8 +216,6 @@ def main(argv=None):
     skip = {} if acquisitions else set()
     for res in res_list:
         skip |= writer.existing_scenes(res, months) if acquisitions else writer.existing_keys(res, months)
-    if acquisitions and any(key[2] is None for key in skip):    # the catalog was out of date
-        return _refuse_old_store(a.dataset)
     if acquisitions:
         full = sum(1 for held in skip.values() if held is None)
         log.info(f"  {len(skip)} tiles already stored ({full} complete, "

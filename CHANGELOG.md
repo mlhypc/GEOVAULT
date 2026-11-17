@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.10.0 (2026-11-17)
+
+Breaking: one store format. A store written before 0.9.0 can no longer be read or
+added to (its files lack the `acq` and `valid_px` columns): delete `data/store` and
+`data/catalog` (under `GEOVAULT_DATA` when that is set) and ingest again. Files
+written by 0.9.0 are read as before and keep the row groups they have until their
+month is written again: by `geovault reencode <dataset>`, or by the compaction that
+follows new tiles (`geovault compact` leaves a sealed month alone). Dependencies:
+`pyarrow>=16` is new (it writes the store files) and DuckDB is now `>=1.5`; run
+`pip install -e .` again after updating.
+
+- Row groups are sized by the tiles they hold: a group ends at 4 MB of tiles or 2048
+  tiles (`store.GROUP_BYTES`, `store.GROUP_ROWS`). The files asked DuckDB for groups of
+  256 rows, but its writer makes none smaller than 2048, so most month files were one
+  or two groups and a reader that wanted one tile fetched the month (a 1.4 GB static
+  layer was two groups). Measured on one month file per dataset, one tile: `s1`
+  112 -> 5 ms, `s2` 88 -> 6 ms, `agera5` 27 -> 5 ms. Through `reader.read_tile`, 40
+  tiles picked at random from a whole dataset: `s1` 4.1 -> 0.7 s, `s2` 2.6 -> 1.1 s, a 921 MB static layer 7.3 -> 1.0 s, a
+  1.4 GB one 19.9 -> 1.3 s. Datasets of small tiles (`pardig_nrt`, `chirps`), where
+  2048 tiles are under 4 MB, keep the layout they had. File size differs by less than
+  1%.
+- The price is paid where every key of a dataset is listed, since a file has more
+  groups: the catalog query over 171 `s2` month files takes 0.9 s, was 0.2 s, and
+  the skip-set queries of an ingest over all of them 0.7 s, was 0.2 s.
+- Part files, compaction and `reencode` write through one writer (`store._write_sorted`,
+  pyarrow). Against the `COPY` it replaces it peaks lower in memory (a 921 MB file:
+  3.0 GB, was 4.3 GB) at the same speed for large tiles; a file of 288,000 small tiles
+  takes 5 s, was 2 s. Min/max statistics are written for the key columns, `scene_id`
+  and the bounds only (`store.STAT_COLS`). A part file is written under a temporary
+  name and renamed, so a failed or interrupted flush leaves no half-written part (an
+  interrupted one leaves a `.parquet.tmp` file that nothing reads).
+- Removed: everything that read files and catalogs of earlier versions. `store.scan`
+  is a plain list of files (`store.ADDED_COLS`, `store.has_rows_without_acq` and
+  `catalog.lacks_acquisitions` are gone), `geovault ingest` no longer checks for a
+  store written before 0.9.0 (exit code 3 is gone), and the reader names the CRS and
+  the acquisition in its queries instead of accepting catalog rows without them.
+- Tests: 11 new in `tests/test_row_groups.py` (group sizes on the three write paths,
+  the row limit, a tile larger than a group, groups across read batches, the schema
+  types, statistics, a NaN nodata value found by a filter, a failed part write) and
+  one for `read_tile` on a row without a scene id; the 6 tests of files and catalogs
+  of earlier versions are removed with the code.
+
 ## 0.9.0 (2026-11-17)
 
 Breaking for `s2`, `s1` and `landsat` stores. A store written before this version can
