@@ -15,7 +15,6 @@ Asset hrefs must be signed (planetary_computer.sign); anonymous signing works,
 a free API key only raises rate limits.
 """
 
-from datetime import datetime
 
 import planetary_computer as pc
 import rasterio
@@ -50,22 +49,40 @@ def search(bbox, start, end, limit=None, **_):
     return items[:limit] if limit else items
 
 
-def plan_scene(item, bbox, bands=None, skip_keys=None, keep_offzone=False, aoi=None) -> dict:
-    """band -> number of tiles this scene would still fetch (nothing is read).
-    Edge tiles outside the scene footprint are counted too, so a small residue
-    on scene edges is normal after a full ingest."""
-    from ..aoi import tile_filter
-    bands = bands or DEFAULT_BANDS
-    skip_keys = skip_keys or set()
+ACQUISITIONS = True      # tiles carry `acq`; the CLI plans with Writer.existing_scenes
+
+
+def acquisition(item) -> str:
+    """The orbit a scene was taken on: one overpass of one satellite. The scenes of an
+    overpass are consecutive slices of it; a morning and an evening pass of the same day
+    are two acquisitions. (The orbit number changes at the equator, where the slices on
+    either side come in different CRS and share no tile anyway.)"""
+    return (f"{common.stac_field(item, 'platform')}_"
+            f"{common.stac_field(item, 'sat:absolute_orbit')}")
+
+
+def _todo(item, band, bbox, stored, in_aoi):
+    """(grid, tiles of `band` this scene still has to be read for). No zone rule
+    (keep_offzone=True): that is for MGRS-gridded products; a scene is stored in its own CRS."""
     date, crs = common.scene_date_crs(item)
     grid = Grid(crs, RES, TILE_PX)
+    return grid, common.plan_scene_tiles(
+        grid, bbox, crs, band, date, stored, acquisition(item), item.id, True, in_aoi,
+        extent=common.scene_extent(item, BANDS[band]))
+
+
+def plan_scene(item, bbox, bands=None, skip_keys=None, keep_offzone=False, aoi=None) -> dict:
+    """band -> number of tiles this scene would still fetch (nothing is read).
+    Tiles inside the scene's raster that hold no data are counted too, so a small
+    residue on scene edges is normal after a full ingest."""
+    from ..aoi import tile_filter
+    bands = bands or DEFAULT_BANDS
     in_aoi = tile_filter(aoi)
     out = {}
     for band in bands:
         if BANDS[band] not in item.assets:
             continue
-        # keep_offzone=True: the zone rule is for MGRS-gridded products; a scene is stored in its own CRS
-        n = len(common.plan_tiles(grid, bbox, crs, band, date, skip_keys, True, in_aoi))
+        n = len(_todo(item, band, bbox, skip_keys or {}, in_aoi)[1])
         if n:
             out[band] = n
     return out
@@ -74,12 +91,8 @@ def plan_scene(item, bbox, bands=None, skip_keys=None, keep_offzone=False, aoi=N
 def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
                  keep_offzone=False, aoi=None) -> int:
     bands = bands or DEFAULT_BANDS
-    skip_keys = skip_keys or set()
-    date = datetime.fromisoformat(
-        item.properties["datetime"].replace("Z", "+00:00")).strftime("%Y-%m-%d")
-    epsg = item.properties.get("proj:epsg") or str(item.properties.get("proj:code", "")).replace("EPSG:", "")
-    crs = f"EPSG:{epsg}"
-    grid = Grid(crs, RES, TILE_PX)
+    date, crs = common.scene_date_crs(item)
+    acq = acquisition(item)
     written = 0
 
     from ..aoi import tile_filter
@@ -90,9 +103,7 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
             key = BANDS[band]
             if key not in item.assets:
                 continue
-            # keep_offzone=True: the zone rule is for MGRS-gridded products; a scene is stored in its own CRS
-            todo = common.plan_tiles(grid, bbox, crs, band, date, skip_keys,
-                                     True, in_aoi)
+            grid, todo = _todo(item, band, bbox, skip_keys or {}, in_aoi)
             if not todo:
                 continue
             with rasterio.open(item.assets[key].href) as ds:
@@ -103,7 +114,8 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
                     blob = common.encode_geotiff(arr, grid, tx, ty, crs, NODATA)
                     if writer.add(band, date, tx, ty, crs, RES, TILE_PX,
                                   common.wgs84_bounds(grid, tx, ty, crs),
-                                  NODATA, None, item.id, blob):
+                                  NODATA, None, item.id, blob,
+                                  int((arr != NODATA).sum()), acq=acq):
                         written += 1
             log(f"    {band}: {written} tiles (cumulative)")
     return written

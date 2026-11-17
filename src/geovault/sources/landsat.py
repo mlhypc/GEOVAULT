@@ -46,7 +46,6 @@ scene about a week after acquisition (USGS L2 processing plus their ingest);
 Sentinel-2 on earth-search is same-day.
 """
 
-import io
 import os
 from concurrent.futures import ThreadPoolExecutor
 
@@ -134,22 +133,37 @@ def search(bbox, start, end, cloud_max=None, limit=None):
     return items[:limit] if limit else items
 
 
+ACQUISITIONS = True      # tiles carry `acq`; the CLI plans with Writer.existing_scenes
+
+
+def acquisition(item) -> str:
+    """The path a scene lies on, per satellite: with the date, one overpass. The scenes
+    of an overpass are consecutive rows of the path and overlap north to south."""
+    return (f"{common.stac_field(item, 'platform')}_"
+            f"{common.stac_field(item, 'landsat:wrs_path')}")
+
+
+def _todo(item, band, bbox, stored, in_aoi):
+    """Tiles of `band` this scene still has to be read for. No zone rule
+    (keep_offzone=True): that is for MGRS-gridded products; a scene is stored in its own CRS."""
+    date, crs = common.scene_date_crs(item)
+    return common.plan_scene_tiles(
+        grid_for(crs), bbox, crs, band, date, stored, acquisition(item), item.id, True, in_aoi,
+        extent=common.scene_extent(item, _asset_key(item, band)))
+
+
 def plan_scene(item, bbox, bands=None, skip_keys=None, keep_offzone=False, aoi=None) -> dict:
     """band -> number of tiles this scene would still fetch (nothing is read).
-    Edge tiles outside the scene footprint are counted too, so a small residue
-    on scene edges is normal after a full ingest."""
+    Tiles inside the scene's raster that hold no data are counted too, so a small
+    residue on scene edges is normal after a full ingest."""
     from ..aoi import tile_filter
     bands = bands or DEFAULT_BANDS
-    skip_keys = skip_keys or set()
-    date, crs = common.scene_date_crs(item)
-    grid = grid_for(crs)
     in_aoi = tile_filter(aoi)
     out = {}
     for band in bands:
         if _asset_key(item, band) is None:
             continue
-        # keep_offzone=True: the zone rule is for MGRS-gridded products; a scene is stored in its own CRS
-        n = len(common.plan_tiles(grid, bbox, crs, band, date, skip_keys, True, in_aoi))
+        n = len(_todo(item, band, bbox, skip_keys or {}, in_aoi))
         if n:
             out[band] = n
     return out
@@ -163,10 +177,10 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
     other bands in parallel. All Landsat bands share one 30 m grid, so a band
     tile's cloud_pct is simply the qa tile with the same (x, y)."""
     bands = bands or DEFAULT_BANDS
-    skip_keys = skip_keys or set()
+    skip_keys = skip_keys or {}
     date, crs = common.scene_date_crs(item)
     grid = grid_for(crs)
-    scene = item.id
+    scene, acq = item.id, acquisition(item)
     qa = {}
 
     from ..aoi import tile_filter
@@ -177,8 +191,7 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
         key = _asset_key(item, band)
         if key is None:
             return []
-        # keep_offzone=True: the zone rule is for MGRS-gridded products; a scene is stored in its own CRS
-        todo = common.plan_tiles(grid, bbox, crs, band, date, skip_keys, True, in_aoi)
+        todo = _todo(item, band, bbox, skip_keys, in_aoi)
         if not todo:
             return []
         nodata = NODATA_QA if band == QA_BAND else NODATA
@@ -198,43 +211,30 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
                 rows.append((band, date, tx, ty, crs, RES, TILE_PX,
                              common.wgs84_bounds(grid, tx, ty, crs), nodata, cloud, scene,
                              common.encode_geotiff(arr, grid, tx, ty, crs, nodata, scale, offset),
-                             int((arr != nodata).sum())))   # valid_px: fuller scene wins a same-day key
+                             int((arr != nodata).sum())))   # valid_px
         return rows
 
     written = 0
     with rasterio.Env(**_ENV):
         if QA_BAND in bands:
             for row in fetch_band(QA_BAND):
-                written += 1 if writer.add(*row) else 0
+                written += 1 if writer.add(*row, acq=acq) else 0
         rest = [b for b in bands if b != QA_BAND]
-        qa_skipped = any(k[0] == QA_BAND and k[1] == date for k in skip_keys)
+        qa_skipped = any(k[0] == QA_BAND and k[1] == date and k[2] == acq for k in skip_keys)
         if rest and (not qa or qa_skipped):
-            _load_qa_from_store(writer.dataset, date, crs, qa)
+            _load_qa_from_store(writer.dataset, date, crs, acq, scene, qa)
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             for rows in ex.map(fetch_band, rest):
                 for row in rows:
-                    written += 1 if writer.add(*row) else 0
+                    written += 1 if writer.add(*row, acq=acq) else 0
     log(f"    {written} tiles")
     return written
 
 
-def _load_qa_from_store(dataset, date, crs, qa):
-    """Fill the qa tile dict from already-stored qa_pixel blobs for this date/crs, so a
+def _load_qa_from_store(dataset, date, crs, acq, scene, qa):
+    """Fill the qa tile dict from the stored qa_pixel tiles that hold this scene, so a
     re-run over a partially cached scene still writes real cloud_pct values."""
-    import duckdb
-    from ..store import month_files
-    files = month_files(dataset, RES, date)
-    if not files:
-        return
-    lst = ", ".join(f"'{f.as_posix()}'" for f in files)
-    con = duckdb.connect()
-    rows = con.execute(
-        f"SELECT x, y, data FROM read_parquet([{lst}], union_by_name=true) "
-        f"WHERE band=? AND date=? AND crs=?", [QA_BAND, date, crs]).fetchall()
-    con.close()
-    for x, y, blob in rows:
-        if (x, y) in qa:
-            continue    # freshly fetched this run wins over the stored copy
-        with rasterio.MemoryFile(io.BytesIO(bytes(blob))) as mem:
-            with mem.open() as ds:
-                qa[(x, y)] = ds.read(1)
+    fresh = set(qa)         # fetched this run: wins over the stored copy
+    for (x, y), arr in common.stored_tiles(dataset, RES, QA_BAND, date, crs, acq, scene).items():
+        if (x, y) not in fresh:
+            qa[(x, y)] = arr

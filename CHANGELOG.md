@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.9.0 (2026-11-17)
+
+Breaking for `s2`, `s1` and `landsat` stores. A store written before this version can
+still be read, but `geovault ingest` (also with `--dry-run`) stops with exit code 3
+instead of mixing old and new tiles: delete `data/store/dataset=<name>/` and
+`data/catalog/<name>.parquet` for these three and ingest again. Every other dataset is
+unchanged and needs nothing.
+
+- The acquisition is part of the tile key: `(band, date, acq, crs, x, y)`. A date is a
+  calendar day, and a satellite can image the same ground twice in one: until now the two
+  images shared a key and one was dropped (Sentinel-1 morning and evening pass: on one
+  tile in western Turkey, 528 of the 936 days with data; Sentinel-2B and 2A ten minutes
+  apart on 2025-04-14 and 2025-11-09). `s2`, `s1` and `landsat` tiles name their
+  acquisition in the new store and catalog column `acq` (datatake id without the
+  processing baseline; platform and
+  absolute orbit; platform and WRS path); it is NULL for all other sources.
+- Scenes of one acquisition that each hold part of a tile are merged into one tile. The
+  tile with more valid pixels used to replace the other, so the rest of the ground was
+  lost wherever a tile lies across the cut between two scenes (measured: 28% of the 60 m
+  Sentinel-2 tiles, whose 15 km exceed the 10 km granule overlap, and 3.6% of the
+  Sentinel-1 tiles of a year were partly empty and could be completed). The merge runs
+  when a month is compacted (`common.merge_tiles`): fullest scene first, the others fill
+  its empty pixels; `scene_id` names every scene, joined by `|`.
+- A later run completes a partly empty tile. The skip rule was per tile, so a scene found
+  by a resumed or wider ingest never added its part. A tile without an empty pixel is
+  never fetched again; a partly empty one is skipped only for the scenes it holds
+  (`Writer.existing_scenes`, `common.plan_scene_tiles`).
+- A scene is planned only over the tiles inside its raster (STAC `proj:transform` and
+  `proj:shape`). Every scene used to plan every tile of the bbox, so `--dry-run`
+  reported tiles far outside a scene as missing; the residue on scene edges that remains
+  is smaller (measured on a Sentinel-1 footprint corner: 88 -> 40 tiles).
+- New store and catalog column `valid_px`, the number of pixels holding an observation.
+  Files written before 0.9.0 have neither column and read as NULL (`store.scan`);
+  compaction, the catalog and the reader accept old and new files together.
+- `reader.mosaic` and `reader.clip` take `acq=`. When an exact date holds several
+  acquisitions observed on the request and none is named, they return the one observed
+  on most of it and warn; two overpasses are never blended. Until now the tiles of a
+  date filled each other's gaps, so ground only the other overpass saw now comes back
+  as nodata unless that overpass is named. `reader.acquisitions` lists them.
+  `reader.series` returns one record per acquisition, with `acq` in every record.
+  `reader.read_tile` matches the acquisition of its row and raises when a catalog row
+  matches no stored tile or several (a catalog out of date, or one built before 0.5.0
+  over a file holding the same tile numbers in two UTM zones: rebuild it), where it
+  returned the first match or failed with a `TypeError`.
+- `Writer.add` takes `acq=`; `Writer.close()` compacts a month that holds a tile of an
+  acquisition in several rows (`close(merge=False)` leaves that to a later compaction).
+  `reencode` resolves shared keys the same way as compaction. `store.compact` returns
+  only the months it sealed and `store.compact_month` returns False when the month is
+  locked. `geovault ingest` and `geovault compact` name the months they could not seal
+  and the lock files in the way (another process, or left by a crash) instead of
+  counting those months as sealed.
+- `s1` tiles now store their valid pixel count; the SCL and `qa_pixel` tiles used for
+  `cloud_pct` on a re-run are those that hold the scene itself.
+- Tests: `tests/test_acquisitions.py` (merge and its order independence, two acquisitions
+  on a day, parts from separate runs, tiles that cannot be merged, files and catalogs
+  written before the new columns, the plan per scene, the cloud mask of a scene, the
+  reader's choice of acquisition, scenes not merged yet).
+
 ## 0.8.0 (2026-11-17)
 
 - Fix the zone rule of `s2`. A tile was stored only when its centre lay in the regular UTM

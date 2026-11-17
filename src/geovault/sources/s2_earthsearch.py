@@ -8,7 +8,7 @@ scene; it feeds the per-tile cloud_pct, computed locally with numpy.
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+import re
 
 import rasterio
 from pystac_client import Client
@@ -52,9 +52,30 @@ def search(bbox, start, end, cloud_max=None, limit=None):
     return items[:limit] if limit else items
 
 
+ACQUISITIONS = True      # tiles carry `acq`; the CLI plans with Writer.existing_scenes
+
+
+def acquisition(item) -> str:
+    """The datatake a granule belongs to: one overpass of one satellite. The processing
+    baseline at the end of the datatake id is dropped, so a reprocessed granule stays in
+    the acquisition of the granules stored before."""
+    return re.sub(r"_N\d+\.\d+$", "", common.stac_field(item, "s2:datatake_id"))
+
+
+def _todo(item, band, bbox, stored, keep_offzone, in_aoi):
+    """(grid, tiles of `band` this scene still has to be read for)."""
+    asset_key, res = BAND_TO_ASSET[band]
+    date, crs = common.scene_date_crs(item)
+    grid = Grid(crs, res, TILE_PX)
+    return grid, common.plan_scene_tiles(
+        grid, bbox, crs, band, date, stored, acquisition(item), item.id, keep_offzone, in_aoi,
+        extent=common.scene_extent(item, asset_key))
+
+
 def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
                  keep_offzone=False, aoi=None) -> int:
     """Fetch the requested bands of one scene over bbox/aoi; returns tiles written.
+    skip_keys is Writer.existing_scenes: what the store already holds.
 
     Two waves: SCL first (the cloud_pct source), then the remaining bands in
     parallel (one thread per band, each with its own COG handle). Granules of
@@ -63,29 +84,21 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
     unless keep_offzone is set.
     """
     bands = bands or DEFAULT_BANDS
-    skip_keys = skip_keys or set()
-    date = datetime.fromisoformat(
-        item.properties["datetime"].replace("Z", "+00:00")).strftime("%Y-%m-%d")
-    epsg = item.properties.get("proj:epsg") or item.properties.get("proj:code", "").replace("EPSG:", "")
-    crs = f"EPSG:{epsg}"
-    scene = item.id
+    skip_keys = skip_keys or {}
+    date, crs = common.scene_date_crs(item)
+    scene, acq = item.id, acquisition(item)
     scl = {}
     scl_grid = Grid(crs, 20, TILE_PX)
 
     from ..aoi import tile_filter
     in_aoi = tile_filter(aoi)
 
-    def band_todo(band, res):
-        grid = Grid(crs, res, TILE_PX)
-        return grid, common.plan_tiles(grid, bbox, crs, band, date, skip_keys,
-                                       keep_offzone, in_aoi)
-
     def fetch_band(band):
         """One band -> list of prepared rows (thread-safe: no writer access)."""
         asset_key, res = BAND_TO_ASSET[band]
         if asset_key not in item.assets:
             return []
-        grid, todo = band_todo(band, res)
+        grid, todo = _todo(item, band, bbox, skip_keys, keep_offzone, in_aoi)
         rows = []
         if not todo:
             return rows
@@ -103,7 +116,7 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
                              common.wgs84_bounds(grid, tx, ty, crs), NODATA,
                              cloud, scene,
                              common.encode_geotiff(arr, grid, tx, ty, crs, NODATA),
-                             int((arr != NODATA).sum())))   # valid_px: the fuller granule wins a same-day key
+                             int((arr != NODATA).sum())))   # valid_px
         return rows
 
     written = 0
@@ -111,67 +124,50 @@ def ingest_scene(item, bbox, writer, bands=None, skip_keys=None, log=print,
         # Wave 1: SCL (the cloud source).
         if "SCL" in bands:
             for row in fetch_band("SCL"):
-                written += 1 if writer.add(*row) else 0
-        # If any SCL tile of this date was already cached (skipped), load the
+                written += 1 if writer.add(*row, acq=acq) else 0
+        # If any SCL tile of this acquisition was already cached (skipped), load the
         # stored SCL so the second wave still gets real cloud_pct values instead
         # of NULLs. Checking `not scl` alone is wrong: a partially overlapping
         # AOI fetches some SCL tiles and skips others, and the 10 m tiles under
         # the skipped ones would get None.
         rest = [b for b in bands if b != "SCL"]
-        scl_skipped = any(k[0] == "SCL" and k[1] == date for k in skip_keys)
+        scl_skipped = any(k[0] == "SCL" and k[1] == date and k[2] == acq for k in skip_keys)
         if rest and (not scl or scl_skipped):
-            _load_scl_from_store(writer.dataset, date, crs, scl_grid, scl)
+            _load_scl_from_store(writer.dataset, date, crs, acq, scene, scl)
         # Wave 2: remaining bands in parallel.
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             for rows in ex.map(fetch_band, rest):
                 for row in rows:
-                    written += 1 if writer.add(*row) else 0
+                    written += 1 if writer.add(*row, acq=acq) else 0
     log(f"    {written} tiles")
     return written
 
 
 def plan_scene(item, bbox, bands=None, skip_keys=None, keep_offzone=False, aoi=None) -> dict:
     """band -> number of tiles this scene would still fetch (nothing is read).
-    Edge tiles outside the scene footprint are counted too: they can never be
-    stored, so a small residue on granule edges is normal after a full ingest."""
+    Tiles inside the granule's raster that hold no data (beyond the edge of the swath)
+    are counted too: they can never be stored, so a small residue on granule edges is
+    normal after a full ingest."""
     from ..aoi import tile_filter
     bands = bands or DEFAULT_BANDS
-    skip_keys = skip_keys or set()
-    date, crs = common.scene_date_crs(item)
+    skip_keys = skip_keys or {}
     in_aoi = tile_filter(aoi)
     out = {}
     for band in bands:
-        asset_key, res = BAND_TO_ASSET[band]
-        if asset_key not in item.assets:
+        if BAND_TO_ASSET[band][0] not in item.assets:
             continue
-        n = len(common.plan_tiles(Grid(crs, res, TILE_PX), bbox, crs, band, date,
-                                  skip_keys, keep_offzone, in_aoi))
+        n = len(_todo(item, band, bbox, skip_keys, keep_offzone, in_aoi)[1])
         if n:
             out[band] = n
     return out
 
 
-def _load_scl_from_store(dataset, date, crs, scl_grid, scl):
-    """Fill the SCL tile dict from already-stored SCL blobs for this date/crs."""
-    import io
-    import duckdb
-    import rasterio as rio
-    from ..store import month_files
-    files = month_files(dataset, 20, date)
-    if not files:
-        return
-    lst = ", ".join(f"'{f.as_posix()}'" for f in files)
-    con = duckdb.connect()
-    rows = con.execute(
-        f"SELECT x, y, data FROM read_parquet([{lst}], union_by_name=true) "
-        f"WHERE band='SCL' AND date=? AND crs=?", [date, crs]).fetchall()
-    con.close()
-    for x, y, blob in rows:
-        if (x, y) in scl:
-            continue    # freshly fetched this run wins over the stored copy
-        with rio.MemoryFile(io.BytesIO(bytes(blob))) as mem:
-            with mem.open() as ds:
-                scl[(x, y)] = ds.read(1)
+def _load_scl_from_store(dataset, date, crs, acq, scene, scl):
+    """Fill the SCL tile dict from the stored SCL tiles that hold this scene."""
+    fresh = set(scl)        # fetched this run: wins over the stored copy
+    for (x, y), arr in common.stored_tiles(dataset, 20, "SCL", date, crs, acq, scene).items():
+        if (x, y) not in fresh:
+            scl[(x, y)] = arr
 
 
 def _cloud_for_footprint(scl, scl_grid, grid, tx, ty):

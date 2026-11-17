@@ -206,7 +206,7 @@ terra_view_time_day ... aqua_view_time_night                     (--bands)
 LST is stored raw uint16 with `kelvin = DN * 0.02` written as GeoTIFF scale
 (`ds.scales[0]`), DN 0 = no retrieval. `cloud_pct` of an LST tile is its share
 of DN 0 pixels, computed locally. A tile that is entirely DN 0 (fully cloudy)
-is not stored, exactly like an S2 tile outside its granule; `--dry-run` then
+is not stored, exactly like an S2 tile beyond the edge of its swath; `--dry-run` then
 keeps reporting it and a re-run looks at it again. CRS is the MODIS sinusoidal
 (`+proj=sinu +R=6371007.181`, no EPSG code), 240 px tiles of 222 km anchored
 at (0, 0) (the global origin is an exact multiple of the 1200 px scene, so
@@ -496,19 +496,20 @@ command; it fetches only the tiles that are still missing.
 Failures are per scene, not per run: a scene whose fetch raises is reported as
 `FAILED`, the other scenes of its chunk are still written, the failed ids are
 listed at the end and the exit code is 2. Re-running the same command retries
-exactly those scenes. A native crash inside GDAL cannot be caught this way (the
+exactly those scenes. (Exit code 3: the dataset was stored before 0.9.0 and has to
+be ingested anew, see [Acquisitions](#acquisitions-two-overpasses-on-one-day).) A native crash inside GDAL cannot be caught this way (the
 process dies with no traceback), which is why coverage should be verified from
 the catalog, not from the exit code: `--dry-run` with the ingest's own arguments
 prints, per scene, how many tiles are not in the store yet and exits 0 only when
-nothing is missing. Tiles outside a scene's footprint are never stored, so a
-small residue on granule edges is normal; a scene reporting all of its tiles is
-a gap. Scenes are fetched
+nothing is missing. A Sentinel-2, Sentinel-1 or Landsat scene is planned only
+over the tiles inside its raster; tiles there that hold no data (beyond the
+edge of the swath) are never stored, so a small residue on scene edges is
+normal; a scene reporting all of its tiles is a gap. Scenes are fetched
 concurrently (`--workers`, default 3; each scene already reads its bands in
 parallel), about 2.7x faster than one at a time against the AWS open-data
-buckets. The result does not depend on fetch order: when two scenes of the
-same day cover the same tile (adjacent MGRS granules overlap at their edges),
-the tile with more valid pixels is kept, ties going to the lexically smaller
-scene id.
+buckets. The result does not depend on the order scenes are fetched in within
+a run: scenes of one overpass that each hold part of a tile are merged into one
+tile (see [Acquisitions](#acquisitions-two-overpasses-on-one-day)).
 
 Every ingest logs the same lines to the console and to a run log,
 `data/logs/<dataset>_<YYYYmmdd-HHMMSS>.log`, each stamped with the time. Scene
@@ -550,7 +551,12 @@ arr, transform, crs = clip("s2", "parcel.geojson", "B4", "2024-06-03")
 
 # pixel time series at a point: one tile blob opened per date, nothing else
 for rec in series("s2", lon, lat, "B4"):
-    print(rec["date"], rec["value"], rec["cloud_pct"])
+    print(rec["date"], rec["acq"], rec["value"], rec["cloud_pct"])
+
+# a date with two overpasses: name the one to read
+from geovault.reader import acquisitions
+for acq in acquisitions("s1", bbox, "VV", "2026-03-01"):      # e.g. morning and evening pass
+    arr, transform, crs = mosaic("s1", bbox, "VV", "2026-03-01", acq=acq)
 ```
 
 Points also work on the ingest side; a small square AOI is built around them:
@@ -559,8 +565,9 @@ Points also work on the ingest side; a small square AOI is built around them:
 geovault ingest --dataset s2 --point 36.735 35.325 --buffer 250 --start ... --end ...
 ```
 
-The mosaic is nodata-aware (overlapping tiles fill each other's gaps, the tile
-with the lowest cloud_pct wins where both have data) and resolves to a single
+The mosaic is nodata-aware (overlapping tiles of one acquisition fill each
+other's gaps, the tile with the lowest cloud_pct wins where both have data) and
+resolves to a single
 CRS when the bbox spans a UTM zone boundary (see
 [UTM zones](#utm-zones-which-crs-a-tile-is-stored-in)).
 
@@ -603,13 +610,67 @@ data/
 ```
 
 Row schema: `band, date, x, y, crs, res, tile_px, west/south/east/north (WGS84),
-nodata, cloud_pct, scene_id, data (GeoTIFF blob), size_bytes, fetched_at`.
-Logical key: `(dataset, band, date, crs, x, y)`. The CRS is part of the key because
+nodata, cloud_pct, scene_id, data (GeoTIFF blob), size_bytes, fetched_at, acq,
+valid_px`. `valid_px` is the number of pixels holding an observation; `acq` and
+`valid_px` are absent from files written before 0.9.0 and read as NULL.
+Logical key: `(dataset, band, date, acq, crs, x, y)`. The CRS is part of the key because
 UTM tile numbers restart in every zone: the same `(x, y)` in zones 35 and 36 is ground
-six degrees apart. The catalog carries the CRS too, and the reader uses it to pick the
-right tile. Tiles are keyed to the ground, never
-to a parcel or project, so overlapping AOIs share tiles and deleting an AOI
-never invalidates data.
+six degrees apart. `acq` is part of it because a satellite can image the same ground
+twice on one date (next section); it is NULL for every source where that cannot happen.
+The catalog carries both, and the reader uses them to pick the right tile. Tiles are
+keyed to the ground, never to a parcel or project, so overlapping AOIs share tiles and
+deleting an AOI never invalidates data.
+
+### Acquisitions: two overpasses on one day
+
+`date` is a calendar day (UTC), and one day can hold two images of the same ground: a
+Sentinel-1 morning and evening pass (on one tile in western Turkey, 528 of the 936
+days with data), or two Sentinel-2 satellites (2B and 2A ten minutes apart on
+2025-04-14 and 2025-11-09). They are different measurements, so `s2`, `s1` and
+`landsat` tiles carry the acquisition they come from in `acq`, which names the
+overpass within its date, and two overpasses are two tiles:
+
+| Source | `acq` | Example |
+|---|---|---|
+| `s2` | datatake id without the processing baseline | `GS2C_20260305T081821_007813` |
+| `s1` | platform and absolute orbit | `sentinel-1a_63436` |
+| `landsat` | platform and WRS path | `landsat-9_175` |
+
+The same `acq` comes back on other dates (a Landsat satellite repeats a path every 16
+days); it is the date and `acq` together that name one overpass. An overpass that
+crosses 00:00 UTC falls on two dates and is stored as two.
+
+One overpass is delivered cut into scenes (MGRS granules, Sentinel-1 slices, Landsat
+rows), and a tile across a cut is partly empty in each of them. Scenes of the same
+acquisition are therefore merged into one tile when the month is compacted: the scene
+with the most observed pixels comes first, ties going to the smaller scene id, and the
+others only fill pixels that are still empty. `scene_id` then names every scene, joined
+by `|`, and `cloud_pct` is the mean of the scenes' values weighted by the pixels each
+contributes. Where scenes overlap their pixels can differ slightly (each granule is
+processed on its own); the first scene's are kept, so a tile built from three or more
+scenes can differ by those pixels depending on which of them were ingested together.
+
+A later run completes a tile: a stored tile without an empty pixel is never fetched
+again; a partly empty one is skipped only for the scenes it already holds, so a scene
+found by a later, wider or resumed ingest still adds its part. A scene a tile already
+holds is not fetched again, so a scene published anew under the same id does not
+replace its pixels.
+
+Reading: `series` returns one record per acquisition, each naming its `acq`.
+On an exact date `mosaic` and `clip` never blend two overpasses: `acq=` names the one
+to read, and without it they return the one observed on most of the request and warn,
+naming it and the others with the number of sample points each observed. An overpass
+whose tiles reach the request without an observation on it does not count.
+`reader.acquisitions` lists the overpasses with a tile over a bbox. No call
+composites the overpasses of one day; read each and combine them as the data allows.
+A date prefix (`"2026-03"`) remains a composite over everything it matches, and
+`acq=` then narrows it to the acquisitions of that name.
+
+Upgrading: a `s2`, `s1` or `landsat` store written before 0.9.0 has no acquisitions.
+It can still be read, with the old behaviour, but `geovault ingest` (also with
+`--dry-run`) stops with exit code 3 instead of mixing old and new tiles. To ingest,
+delete `data/store/dataset=<name>/` and `data/catalog/<name>.parquet` (under
+`GEOVAULT_DATA` when that is set) and ingest again. All other datasets are untouched.
 
 ### Write pattern (hot month)
 
@@ -621,7 +682,13 @@ into a single sealed file at close, and **every finished run seals all the month
 it touched**, so part files exist only while a run is in progress (or after a
 crash). `geovault compact <dataset>` does the same on demand and doubles as crash
 repair. Readers go through the catalog's `file` column, so parts are transparent
-to them either way.
+to them either way. Compaction is also where rows sharing a key are resolved: a
+re-fetched tile keeps its newest copy, and the scenes of one acquisition are merged
+into one tile. Until then such a tile is one row per scene, each partly empty, and
+readers see those rows. `Writer.close()` merges the months written since the last
+merge; after `close(merge=False)`, or when another process held the month, call
+`store.compact(dataset)`. When an ingest could not seal a month it says so and names
+the command.
 
 ### Blob encoding
 

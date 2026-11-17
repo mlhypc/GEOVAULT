@@ -36,6 +36,33 @@ def scene_months(item) -> list:
     return months or [props["datetime"][:7]]
 
 
+def _report_open(dataset, say) -> None:
+    """Name the months a compaction could not seal, and what to do about them."""
+    left = _store.open_months(dataset)
+    if not left:
+        return
+    say(f"  {len(left)} (res, month) groups are still open, their tiles not merged yet: "
+        + ", ".join(f"{date[:7] or 'static'} r{int(res)}" for res, date in left))
+    locks = [_store.lock_file(dataset, res, date) for res, date in left]
+    locks = [str(f) for f in locks if f.exists()]
+    if locks:
+        say(f"  another process is compacting them, or a crash left these lock files behind: "
+            + ", ".join(locks))
+        say(f"  when no geovault process is running, delete the lock files and run "
+            f"`geovault compact {dataset}`")
+    else:
+        say(f"  run `geovault compact {dataset}`")
+
+
+def _refuse_old_store(dataset) -> int:
+    """Exit code 3: the dataset was stored before tiles named their acquisition."""
+    print(f"geovault: the {dataset} store was written before 0.9.0. Its tiles do not name "
+          f"their acquisition and cannot be mixed with new ones, so nothing was fetched or "
+          f"checked. It can still be read. To ingest, delete {_store.STORE / ('dataset=' + dataset)} "
+          f"and {catalog.path(dataset)}, then ingest again.", file=sys.stderr)
+    return 3
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="geovault")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -87,6 +114,7 @@ def main(argv=None):
     if a.cmd == "compact":
         done = compact(a.dataset)
         print(f"compacted {len(done)} (res, month) groups")
+        _report_open(a.dataset, print)
         catalog.rebuild(a.dataset)
         return 0
 
@@ -126,6 +154,10 @@ def main(argv=None):
         return 0
 
     # ingest
+    src = REGISTRY[a.dataset]
+    acquisitions = getattr(src, "ACQUISITIONS", False)
+    if acquisitions and catalog.lacks_acquisitions(a.dataset):
+        return _refuse_old_store(a.dataset)
     from .log import setup as _setup_log, Progress
     log = _setup_log(a.dataset)
     aoi = None
@@ -143,7 +175,6 @@ def main(argv=None):
     if not a.bbox:
         ap.error("ingest needs --bbox, --geojson or --point")
 
-    src = REGISTRY[a.dataset]
     bbox = tuple(a.bbox)
     t0 = time.time()
 
@@ -168,6 +199,7 @@ def main(argv=None):
         sealed = compact(a.dataset)     # no open parts after a finished run (see the dated path)
         if sealed:
             log.info(f"  sealed {len(sealed)} (res, month) groups")
+        _report_open(a.dataset, log.info)
         ncat = catalog.rebuild(a.dataset)
         log.info(f"  catalog updated: {ncat} rows")
         log.info(f"done: {total} new tiles in {time.time() - t0:.0f}s")
@@ -190,16 +222,25 @@ def main(argv=None):
     res_list = sorted({r for _, r in
                        (src.BAND_TO_ASSET.values() if hasattr(src, "BAND_TO_ASSET")
                         else [(None, src.RES)])})
-    skip = set()
+    # what is stored already: a set of tile keys, or for a source with acquisitions the
+    # scenes each stored tile holds (a partly empty tile may still gain from another scene)
+    skip = {} if acquisitions else set()
     for res in res_list:
-        skip |= writer.existing_keys(res, months)
-    log.info(f"  {len(skip)} tiles already cached (will be skipped)")
+        skip |= writer.existing_scenes(res, months) if acquisitions else writer.existing_keys(res, months)
+    if acquisitions and any(key[2] is None for key in skip):    # the catalog was out of date
+        return _refuse_old_store(a.dataset)
+    if acquisitions:
+        full = sum(1 for held in skip.values() if held is None)
+        log.info(f"  {len(skip)} tiles already stored ({full} complete, "
+                 f"{len(skip) - full} partly empty: those can still gain from other scenes)")
+    else:
+        log.info(f"  {len(skip)} tiles already cached (will be skipped)")
 
     if a.dry_run:
-        # Coverage check against the catalog: what would still be fetched.
-        # Exit 0 when nothing is missing, 1 otherwise. Edge tiles outside a
-        # scene's footprint are never stored, so a small residue on granule
-        # edges is normal; a whole scene reporting all its tiles is a gap.
+        # Coverage check against the store: what would still be fetched.
+        # Exit 0 when nothing is missing, 1 otherwise. Tiles a scene holds no
+        # data for are never stored, so a small residue on scene edges is
+        # normal; a whole scene reporting all its tiles is a gap.
         if not hasattr(src, "plan_scene"):
             ap.error(f"{a.dataset} does not support --dry-run")
         missing = 0
@@ -239,7 +280,9 @@ def main(argv=None):
         for start in range(0, len(items), FLUSH_EVERY):
             chunk = list(enumerate(items[start:start + FLUSH_EVERY], start + 1))
             total += sum(ex.map(one, chunk))
-            writer.close()                 # rows -> new part files (auto-compacted past the threshold)
+            # rows -> new part files (auto-compacted past the threshold). Scenes of one
+            # acquisition are merged by the compaction at the end, not after every chunk.
+            writer.close(merge=False)
 
     writer.close()
     for f, n in writer.written.items():
@@ -250,6 +293,7 @@ def main(argv=None):
     sealed = compact(a.dataset)
     if sealed:
         log.info(f"  sealed {len(sealed)} (res, month) groups")
+    _report_open(a.dataset, log.info)
     ncat = catalog.rebuild(a.dataset)
     log.info(f"  catalog updated: {ncat} rows")
     if failed:

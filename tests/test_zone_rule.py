@@ -106,8 +106,12 @@ def test_a_crs_without_a_utm_zone_has_no_zone_rule():
 
 
 def item(crs, assets):
-    return SimpleNamespace(id="scene", assets={a: None for a in assets},
-                           properties={"datetime": "2026-07-02T08:00:00Z", "proj:code": crs})
+    """A STAC item as the three adapters read it, with the fields each takes its
+    acquisition from."""
+    return SimpleNamespace(id="scene", assets={a: None for a in assets}, properties={
+        "datetime": "2026-07-02T08:00:00Z", "proj:code": crs, "platform": "satellite",
+        "s2:datatake_id": "GS2A_20260702T080000_000001_N05.11", "sat:absolute_orbit": 1,
+        "landsat:wrs_path": "175"})
 
 
 def test_s2_plan_follows_the_mgrs_rule():

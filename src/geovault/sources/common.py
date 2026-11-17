@@ -96,6 +96,61 @@ def reencode_blob(blob: bytes) -> bytes:
     return out if len(out) < len(blob) else blob
 
 
+def observed(arr, nodata):
+    """True where a pixel holds an observation. A band without a nodata value has one
+    everywhere."""
+    if nodata is None:
+        return np.ones(arr.shape, bool)
+    if nodata != nodata:                    # NaN
+        return ~np.isnan(arr)
+    return arr != nodata
+
+
+def merge_tiles(parts):
+    """Merge tiles of one acquisition that each hold part of the same ground: adjacent
+    scenes (granules, slices) cut one overpass, and a tile across the cut is partly
+    empty in each of them.
+
+    parts: (scene_id, blob, cloud_pct) per tile; a scene_id may already name several
+    scenes ('a|b') when the tile is itself the result of a merge. The tile with the most
+    observed pixels comes first (ties: the smaller scene id) and each following one only
+    fills pixels that are still empty, so the result does not depend on the order of
+    `parts`. Where scenes overlap their pixels can differ slightly; the first one's are
+    kept; a tile is never replaced by a newer copy of a scene it already holds.
+
+    Returns (blob, valid_px, scene_id, cloud_pct): scene_id names every scene, joined by
+    '|'; cloud_pct is the mean of the tiles' values weighted by the pixels each one
+    contributes, an estimate, or None when none has one. Raises ValueError when the
+    tiles differ in size or data type."""
+    tiles = []
+    for scene, blob, cloud in parts:
+        with rasterio.MemoryFile(bytes(blob)) as mem:
+            with mem.open() as ds:
+                arr = ds.read(1)
+                scale = ds.scales[0] if ds.scales and ds.scales[0] != 1.0 else None
+                offset = ds.offsets[0] if ds.offsets and ds.offsets[0] != 0.0 else None
+                meta = (ds.crs, ds.transform, ds.nodata, scale, offset)
+        tiles.append((scene or "", arr, observed(arr, meta[2]), cloud, blob, meta))
+    if len({(t[1].shape, t[1].dtype) for t in tiles}) > 1:
+        raise ValueError("tiles of one key differ in size or data type: "
+                         + ", ".join(f"{t[0]} {t[1].shape} {t[1].dtype}" for t in tiles))
+    tiles.sort(key=lambda t: (-int(t[2].sum()), t[0]))
+    _, out, seen, cloud, first_blob, (crs, transform, nodata, scale, offset) = tiles[0]
+    out, seen = out.copy(), seen.copy()
+    shares = [(cloud, int(seen.sum()))]
+    for _, arr, obs, cloud, _, _ in tiles[1:]:
+        take = obs & ~seen
+        out[take] = arr[take]
+        seen |= take
+        shares.append((cloud, int(take.sum())))
+    scenes = "|".join(sorted({s for t in tiles for s in t[0].split("|") if s})) or None
+    known = [(c, n) for c, n in shares if c is not None and n]
+    cloud = round(sum(c * n for c, n in known) / sum(n for _, n in known), 2) if known else None
+    filled = any(n for _, n in shares[1:])
+    blob = encode_blob(out, crs, transform, nodata, scale, offset) if filled else bytes(first_blob)
+    return blob, int(seen.sum()), scenes, cloud
+
+
 from functools import lru_cache
 
 
@@ -232,6 +287,95 @@ def scene_date_crs(item) -> tuple:
         item.properties["datetime"].replace("Z", "+00:00")).strftime("%Y-%m-%d")
     epsg = item.properties.get("proj:epsg") or str(item.properties.get("proj:code", "")).replace("EPSG:", "")
     return date, f"EPSG:{epsg}"
+
+
+def stored_tiles(dataset, res, band, date, crs, acq, scene) -> dict:
+    """(x, y) -> array of the tiles of one band already stored for an acquisition that
+    hold the given scene: the mask a scene's other bands are judged by (SCL, qa_pixel)
+    has to be its own, not that of a neighbouring scene of the overpass. A tile still
+    held in several rows (scenes not merged yet) comes back merged as compaction would
+    merge it, the fullest row first."""
+    import duckdb
+    from ..store import month_files, scan
+    files = month_files(dataset, res, date)
+    if not files:
+        return {}
+    con = duckdb.connect()
+    rows = con.execute(
+        f"SELECT x, y, scene_id, data FROM {scan(files)} WHERE band = ? AND date = ? "
+        f"AND crs = ? AND acq IS NOT DISTINCT FROM ?", [band, date, crs, acq]).fetchall()
+    con.close()
+    by_tile = {}
+    for x, y, scenes, blob in rows:
+        with rasterio.MemoryFile(bytes(blob)) as mem:
+            with mem.open() as ds:
+                arr, nodata = ds.read(1), ds.nodata
+        by_tile.setdefault((x, y), []).append((scenes or "", arr, observed(arr, nodata)))
+    out = {}
+    for key, parts in by_tile.items():
+        if not any(scene in scenes.split("|") for scenes, _, _ in parts):
+            continue
+        parts.sort(key=lambda p: (-int(p[2].sum()), p[0]))
+        arr, seen = parts[0][1], parts[0][2].copy()
+        for _, other, obs in parts[1:]:
+            take = obs & ~seen
+            arr[take] = other[take]
+            seen |= take
+        out[key] = arr
+    return out
+
+
+def stac_field(item, name):
+    """A STAC property an adapter cannot do without, with an error that names the scene."""
+    try:
+        return item.properties[name]
+    except KeyError:
+        raise ValueError(f"{getattr(item, 'id', 'STAC item')} has no {name!r}: "
+                         f"its acquisition cannot be named") from None
+
+
+def scene_extent(item, asset_key=None):
+    """Native (west, south, east, north) of a scene's raster from the STAC projection
+    fields (proj:transform and proj:shape, on the asset or on the item), or None when the
+    item does not carry them."""
+    asset = getattr(item, "assets", {}).get(asset_key)
+    for fields in (getattr(asset, "extra_fields", None), item.properties):
+        if fields and "proj:transform" in fields and "proj:shape" in fields:
+            t, (rows, cols) = fields["proj:transform"], fields["proj:shape"]
+            if t[1] or t[3]:            # a rotated raster: its extent is not this rectangle
+                return None
+            xs, ys = (t[2], t[2] + t[0] * cols), (t[5], t[5] + t[4] * rows)
+            return (min(xs), min(ys), max(xs), max(ys))
+    return None
+
+
+def plan_scene_tiles(grid, bbox, crs, band, date, stored, acq, scene, keep_offzone, in_aoi,
+                     extent=None) -> list:
+    """plan_tiles for a source with acquisitions: the tiles of `band` this scene still has
+    to be read for. `stored` is Writer.existing_scenes: a tile without an empty pixel is
+    complete; a partly empty one is skipped only for the scenes it already holds, since
+    another scene of the same acquisition can hold the missing part. A tile of another
+    acquisition on the same date is a different tile. `extent`, the scene's raster in
+    native coordinates (scene_extent), keeps the plan to the tiles the scene can hold;
+    without it every tile of the bbox is planned for every scene."""
+    nw, ns, ne, nn = bbox_to_crs(bbox, crs)
+    if extent is not None:
+        nw, ns, ne, nn = max(nw, extent[0]), max(ns, extent[1]), min(ne, extent[2]), min(nn, extent[3])
+        if nw >= ne or ns >= nn:
+            return []
+    out = []
+    for tx, ty in grid.tiles_for_bounds(nw, ns, ne, nn):
+        held = stored.get((band, date, acq, crs, tx, ty), ())
+        if held is None or scene in held:
+            continue
+        if extent is not None:
+            w, s, e, n = grid.tile_bounds(tx, ty)
+            if e <= extent[0] or w >= extent[2] or n <= extent[1] or s >= extent[3]:
+                continue
+        if (keep_offzone or tile_is_canonical(grid, tx, ty, crs)) \
+                and in_aoi(wgs84_bounds(grid, tx, ty, crs)):
+            out.append((tx, ty))
+    return out
 
 
 def plan_tiles(grid, bbox, crs, band, date, skip_keys, keep_offzone, in_aoi) -> list:
