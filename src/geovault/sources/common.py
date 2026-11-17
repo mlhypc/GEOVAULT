@@ -169,11 +169,33 @@ def wgs84_bounds(grid, tx, ty, crs) -> tuple:
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+# The edges of a bbox are followed in steps of this many degrees when it is reprojected.
+EDGE_STEP_DEG = 0.02
+
+
 def bbox_to_crs(bbox, crs) -> tuple:
-    """WGS84 (w, s, e, n) -> native CRS rectangle (envelope of reprojected corners)."""
+    """WGS84 (w, s, e, n) -> the native CRS rectangle that holds it. The edges are
+    followed, not only the corners: a parallel is a curve in UTM, so an edge of a bbox
+    that lies across the central meridian bulges beyond its corners (116 m for a bbox
+    one degree wide, 4 km for one a whole zone wide, 23 km for one three zones wide),
+    and a rectangle made from the corners left the tiles of that strip out of every
+    plan. Points along the edges are reprojected one by one; a bbox no larger than one
+    step has only its corners. Points the projection cannot place are left out."""
     w, s, e, n = bbox
-    xs, ys = _transformer("EPSG:4326", str(crs)).transform([w, e, w, e], [s, s, n, n])
-    return (min(xs), min(ys), max(xs), max(ys))
+    tr = _transformer("EPSG:4326", str(crs))
+    span = max(abs(e - w), abs(n - s))
+    steps = math.ceil(span / EDGE_STEP_DEG) if math.isfinite(span) else 0
+    if steps <= 1:
+        xs, ys = tr.transform([w, e, w, e], [s, s, n, n])
+        return (min(xs), min(ys), max(xs), max(ys))
+    t = np.linspace(0.0, 1.0, steps + 1)
+    lon, lat = w + (e - w) * t, s + (n - s) * t
+    xs, ys = tr.transform(np.concatenate([lon, lon, np.full_like(t, w), np.full_like(t, e)]),
+                          np.concatenate([np.full_like(t, s), np.full_like(t, n), lat, lat]))
+    ok = np.isfinite(xs) & np.isfinite(ys)
+    if not ok.any():
+        return (math.inf,) * 4
+    return (float(xs[ok].min()), float(ys[ok].min()), float(xs[ok].max()), float(ys[ok].max()))
 
 
 def candidate_tiles(grid, bbox, crs, aoi=None):

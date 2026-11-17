@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.10.2 (2026-11-17)
+
+- An ingest left tiles out of its plan along one edge of the area. `common.bbox_to_crs`
+  made the native rectangle of a bbox (of `--bbox`, or of the bounds of a `--geojson`
+  area) from its four corners, but a parallel is a curve in UTM: where a bbox lies
+  across the central meridian of the zone its south edge dips below its corners (the
+  north edge in the southern hemisphere; in a sinusoidal grid the east and west edges
+  of a bbox across the equator). The dip is 7 m for a bbox a quarter of a degree wide,
+  116 m for one degree, 4.2 km for a whole zone. Measured on a 10 m grid with the zone
+  rule: a bbox one zone wide lost 147 of 53,252 tiles, a bbox from 26 to 45 E lost
+  1,843 tiles of zone 36 (22.7 km) and 1,207 of zone 37 (16.7 km); a bbox of one
+  degree lost tiles in 32 of 600 positions tried, a parcel loses nothing (5 cm). The
+  edges are now followed in steps of 0.02 degrees (`common.EDGE_STEP_DEG`), which
+  leaves centimetres. Also fixed by this: a UTM bbox reaching a pole collapsed to a
+  line. Sources stored in a geographic CRS were never affected.
+  To fill what a past ingest left out, run it again: it fetches only the missing tiles.
+- Tests: `tests/test_bbox_plan.py`, 23 tests (the tile under the bulging edge in six
+  cases, every point of a bbox inside its native rectangle, a small bbox planned as
+  before, a bbox given the other way round, an empty part of an AOI, a geographic CRS
+  on another datum).
+
 ## 0.10.1 (2026-11-17)
 
 Three ways the store could lose or split tiles; all of them older than 0.10.0.
