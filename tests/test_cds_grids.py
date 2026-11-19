@@ -1,7 +1,9 @@
 """Offline checks for the CDS adapters (ERA5-Land, AgERA5): lattice, request area, tile cutting."""
 
 import numpy as np
-import xarray as xr
+import pytest
+
+xr = pytest.importorskip("xarray", reason="needs the [cds] extra")
 
 from geovault.sources import agera5, era5land, era5land_daily
 

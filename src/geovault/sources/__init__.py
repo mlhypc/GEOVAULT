@@ -4,6 +4,7 @@ one REGISTRY line; the engine (grid/store/catalog/reader) rarely needs to change
 from . import (
     s2_earthsearch, s1_pc, landsat,
     dem_glo30, dem_glo90, dem_nasadem, dem_aw3d30, dem_gedtm30, dem_fabdem, dem_3dep_1m,
+    dem_gem15,
     worldcover, soilgrids,
     chirps, modis_lst, modis_vi, modis_vi_1km, s3_syn_v10, cgls_ndvi300,
     modis_fire, modis_burned,
@@ -22,6 +23,7 @@ REGISTRY = {
     "gedtm30": dem_gedtm30,
     "fabdem": dem_fabdem,
     "3dep_1m": dem_3dep_1m,
+    "gem15": dem_gem15,
     "worldcover": worldcover,
     "soilgrids": soilgrids,
     "chirps": chirps,

@@ -143,7 +143,7 @@ def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
                     if arr is not None:
                         blob = common.encode_geotiff(arr, grid, tx, ty, crs, nd)
                         # valid_px lets the fuller tile win if two files ever yield the same key
-                        valid = int(np.count_nonzero(arr != nd))
+                        valid = int(np.count_nonzero(common.observed(arr, nd)))
                         if writer.add(band, "", tx, ty, crs, grid.res, tile_px,
                                       wb, nd, None, source_id, blob, valid):
                             written += 1
@@ -154,5 +154,6 @@ def ingest_assets(hrefs, band, writer, bbox, tile_px, skip_keys=None, aoi=None,
             log(f"    [{i}/{len(hrefs)}] {name}: {asset_written} tiles  | {prog.tick()}")
     log(f"    {band}: {written} tiles")
     if failed:
+        writer.leave_out(failed)
         log(f"    {band}: {failed} assets failed to open; run the same command again to fetch them")
     return written

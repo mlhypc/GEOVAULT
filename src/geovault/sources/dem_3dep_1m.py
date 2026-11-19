@@ -231,5 +231,6 @@ def ingest(bbox, writer, bands=None, skip_keys=None, aoi=None, log=print) -> int
             f"{stored} tiles  | {prog.tick()}")
     log(f"    DEM: {written} tiles")
     if failed:
+        writer.leave_out(failed)
         log(f"    DEM: {failed} files or cells failed to open; run the same command again")
     return written

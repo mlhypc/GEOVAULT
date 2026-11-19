@@ -3,6 +3,9 @@ observation (no stored tile, nodata inside a tile, outside the polygon), bands t
 nodata value at all, the masked return, and, where the request is stored in more than one
 CRS, which CRS the result takes and when it warns that ground was left out."""
 
+import os
+
+import duckdb
 import numpy as np
 import pytest
 from pyproj import Transformer
@@ -91,6 +94,47 @@ def test_mosaic_keeps_values_and_nodata(vault):
     assert (transform.c, transform.f) == (X0, Y1)
     assert arr[0, 0] == -9999.0
     assert (arr == 5.5).sum() == arr.size - 1
+
+
+def test_mosaic_opens_the_catalog_and_a_month_file_once(vault, monkeypatch):
+    """Four tiles of one month file take two connections, one for the catalog and one
+    for the file, not one per tile; so does a date prefix, which matches two dates."""
+    opened = []
+    connect = reader.duckdb.connect
+    monkeypatch.setattr(reader.duckdb, "connect",
+                        lambda *a, **k: opened.append(1) or connect(*a, **k))
+    arr, _, _ = reader.mosaic("edge", block_bbox(), "u", "2026-01-01")
+    assert arr.shape == (2 * PX, 2 * PX) and len(opened) == 2
+    arr, _, _ = reader.mosaic("edge", block_bbox(), "two", "2026-01")
+    assert arr[0, 0] == 2 and len(opened) == 4
+
+
+def rewrite_month(select):
+    """Rewrite the one month file of the vault with the rows of a query on it."""
+    path = reader.tiles_for_bbox("edge", block_bbox())[0]["file"]
+    rows = select.format(f=f"read_parquet('{path}')")
+    con = duckdb.connect()
+    con.execute(f"COPY ({rows}) TO '{path}.tmp' (FORMAT PARQUET)")
+    con.close()
+    os.replace(path + ".tmp", path)
+
+
+def test_mosaic_raises_when_a_catalog_row_matches_two_stored_tiles(vault):
+    """No writer of the store puts a key twice into one file; a file that holds one
+    twice is not read as if nothing were wrong."""
+    rewrite_month("SELECT * FROM {f} UNION ALL SELECT * FROM {f} WHERE band = 'u' AND x = 0 AND y = 0")
+    for read in (lambda: reader.mosaic("edge", block_bbox(), "u", "2026-01-01"),
+                 lambda: reader.clip("edge", inner_polygon(), "u", "2026-01-01"),
+                 lambda: reader.series("edge", *TO_WGS.transform(X0 + 5, Y1 - 5), "u")):
+        with pytest.raises(RuntimeError, match="several stored tiles.*rebuild the catalog"):
+            read()
+    assert reader.mosaic("edge", block_bbox(), "f", "2026-01-01")[0].shape == (2 * PX, 2 * PX)
+
+
+def test_mosaic_raises_on_a_stale_catalog(vault):
+    rewrite_month("SELECT * FROM {f} WHERE NOT (band = 'u' AND x = 0 AND y = 0)")
+    with pytest.raises(RuntimeError, match="not found.*rebuild the catalog"):
+        reader.mosaic("edge", block_bbox(), "u", "2026-01-01")
 
 
 def test_clip_fills_outside_with_the_band_nodata(vault):

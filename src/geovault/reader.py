@@ -9,16 +9,15 @@ DuckDB-only alternative for non-Python consumers:
     SELECT ... FROM read_parquet('GEOVAULT/data/catalog/s2.parquet') WHERE ...
 """
 
-import io
 import math
 import warnings
 from pathlib import Path
 
 import duckdb
 import numpy as np
-import rasterio
 
 from . import catalog
+from .blob import decode as _decode
 from .sources.common import observed as _observed
 
 
@@ -29,15 +28,17 @@ def tiles_for_bbox(dataset, bbox, band=None, date=None) -> list:
     p = catalog.path(dataset)
     if not p.exists():
         return []
-    where = [catalog.bbox_sql(bbox)]
+    where, args = [catalog.bbox_sql(bbox)], []
     if band:
-        where.append(f"band = '{band}'")
+        where.append("band = ?")
+        args.append(band)
     if date:
-        where.append(f"date LIKE '{date}%'")
+        where.append("date LIKE ?")
+        args.append(f"{date}%")
     con = duckdb.connect()
     cur = con.execute(
         f"SELECT * FROM read_parquet('{p.as_posix()}') "
-        f"WHERE {' AND '.join(where)} ORDER BY band, date, x, y")
+        f"WHERE {' AND '.join(where)} ORDER BY band, date, x, y", args)
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     con.close()
@@ -210,13 +211,16 @@ def _mosaic(dataset, bbox, band, date, masked, within=None, acq=None):
     tile covers a pixel or the tile holds nodata there; those pixels of `array` hold the
     band's nodata value, or 0 when the band has none (allowed only with `masked`). `within`
     narrows the request the two warnings look at from the bbox to a WGS84 geometry."""
-    exact = [r for r in tiles_for_bbox(dataset, bbox, band, date) if r["date"] == date]
-    rows = exact or tiles_for_bbox(dataset, bbox, band, date)
+    found = tiles_for_bbox(dataset, bbox, band, date)
+    exact = [r for r in found if r["date"] == date]
+    rows = exact or found
     if acq is not None:
         rows = [r for r in rows if r["acq"] == acq]
     if not rows:
         return None
-    tiles = [(r, *read_tile(r)) for r in rows]
+    tiles = [None] * len(rows)              # one query per month file, not one per tile
+    for i, blob in _blobs_by_row(rows):
+        tiles[i] = (rows[i], *_decode(blob))
 
     # One acquisition: a date can hold two overpasses of the same ground (Sentinel-1 in
     # the morning and in the evening, two Sentinel-2 satellites), and they are different
@@ -304,16 +308,17 @@ def _blobs_by_row(rows):
     """Yield (row index, pixel blob) for many catalog rows, one query per month file instead
     of one per row. Hourly and sub-hourly layers hold thousands of dates per month; a query
     per date cost about 20 ms each, mostly connection and file-open overhead. Blobs are
-    yielded file by file, so memory holds one batch at a time, not the whole series.
+    yielded file by file, so memory holds one batch at a time, not the whole request.
 
-    A row the catalog names but its file no longer holds raises, as read_tile does: the
-    catalog is stale and must be rebuilt."""
+    A row the catalog names but its file no longer holds raises, and so does a row that
+    matches several stored tiles, as read_tile does: the catalog is stale and must be
+    rebuilt."""
     by_file = {}
     for i, r in enumerate(rows):
         by_file.setdefault(r["file"], []).append(i)
     with duckdb.connect() as con:
         for f, idx in by_file.items():
-            want = {}
+            want, served = {}, set()
             for i in idx:
                 r = rows[i]
                 scene = r["scene_id"] if r["acq"] is not None else None
@@ -321,29 +326,34 @@ def _blobs_by_row(rows):
                                  scene), []).append(i)
             sub = [rows[i] for i in idx]
             dates = [r["date"] for r in sub]
+            bands, xs, ys = (sorted({r[c] for r in sub}) for c in ("band", "x", "y"))
+            # The values are listed in the query, one placeholder each. Handed over as
+            # one list to unnest in a subquery they are joined to the file, which took
+            # twice as long on most reads (37 against 15 ms for one tile of a static
+            # file of 1.4 GB, 21 against 6 ms for 35 tiles of a month).
+            listed = lambda values: ", ".join("?" * len(values))
             cur = con.execute(
                 f"SELECT band, date, x, y, crs, acq, scene_id, data "
                 f"FROM read_parquet('{Path(f).as_posix()}') "
-                f"WHERE band IN (SELECT unnest(?)) AND date BETWEEN ? AND ? "
-                f"AND x IN (SELECT unnest(?)) AND y IN (SELECT unnest(?))",
-                [sorted({r["band"] for r in sub}), min(dates), max(dates),
-                 sorted({r["x"] for r in sub}), sorted({r["y"] for r in sub})])
+                f"WHERE band IN ({listed(bands)}) AND date BETWEEN ? AND ? "
+                f"AND x IN ({listed(xs)}) AND y IN ({listed(ys)})",
+                [*bands, min(dates), max(dates), *xs, *ys])
             while batch := cur.fetchmany(256):
                 for band, d, x, y, crs, acq, scene, data in batch:
-                    hits = want.get((band, d, x, y, crs, acq, scene if acq is not None else None))
-                    if hits:
-                        yield hits.pop(), data
-            left = [rows[i] for v in want.values() for i in v]
+                    key = (band, d, x, y, crs, acq, scene if acq is not None else None)
+                    if key not in want:
+                        continue
+                    if key in served:
+                        raise RuntimeError(f"a catalog row matches several stored tiles in {f} "
+                                           f"(band {band} date {d} x {x} y {y}): rebuild the catalog")
+                    served.add(key)
+                    for i in want[key]:
+                        yield i, data
+            left = [rows[i] for key, v in want.items() if key not in served for i in v]
             if left:
                 r = left[0]
                 raise RuntimeError(f"{len(left)} catalog rows not found in {f} (e.g. band {r['band']} "
                                    f"date {r['date']} x {r['x']} y {r['y']}): rebuild the catalog")
-
-
-def _decode(blob):
-    with rasterio.MemoryFile(io.BytesIO(bytes(blob))) as mem:
-        with mem.open() as ds:
-            return ds.read(1), ds.profile
 
 
 def series(dataset, lon, lat, band, date=None):
@@ -354,7 +364,7 @@ def series(dataset, lon, lat, band, date=None):
     list of dicts: {date, value, cloud_pct, scene_id, crs, acq}, oldest first, nodata
     pixels skipped. A date has one record per stored tile at the point: one per
     acquisition when two overpasses imaged it that day (acq is None for sources without
-    acquisitions), and one per CRS where the point is stored in two (see the README on
+    acquisitions), and one per CRS where the point is stored in two (see docs/storage.md on
     UTM zones). date: None | 'YYYY' | 'YYYY-MM' | any prefix of the stored date strings."""
     from pyproj import Transformer
     eps = 1e-9

@@ -18,18 +18,19 @@ from rasterio.windows import from_bounds
 CLOUD_SCL = (1, 3, 8, 9, 10)
 
 
-def read_tile_window(ds, grid, tx, ty, nodata):
-    """Read one grid tile from an open rasterio dataset. Returns the array, or
-    None when the tile is entirely outside the raster or entirely nodata."""
+def read_tile_window(ds, grid, tx, ty, nodata, band=1):
+    """Read one grid tile of one band from an open rasterio dataset. Returns the array,
+    or None when the tile is entirely outside the raster or holds no observation
+    (`observed`: a nodata value of NaN marks a pixel as any other does)."""
     w, s, e, n = grid.tile_bounds(tx, ty)
     rb = ds.bounds
     if e <= rb.left or w >= rb.right or n <= rb.bottom or s >= rb.top:
         return None
     win = from_bounds(w, s, e, n, transform=ds.transform)
-    arr = ds.read(1, window=win, boundless=True, fill_value=nodata)
+    arr = ds.read(band, window=win, boundless=True, fill_value=nodata)
     if arr.shape != (grid.tile_px, grid.tile_px):
         return None
-    if np.all(arr == nodata):
+    if not observed(arr, nodata).any():
         return None
     return arr
 

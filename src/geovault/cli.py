@@ -6,6 +6,8 @@
   geovault compact s2
   geovault reencode agera5          # re-compress stored tiles with the current encoder (lossless)
   geovault rebuild-catalog s2
+  geovault datasets                 # the datasets this version can ingest
+  geovault --version
 
 Also runnable as: python -m geovault ...
 """
@@ -14,7 +16,7 @@ import argparse
 import sys
 import time
 
-from . import catalog
+from . import __version__, catalog
 from .sources import REGISTRY
 from .store import Writer, compact, reencode_month
 from . import store as _store
@@ -34,6 +36,20 @@ def scene_months(item) -> list:
         months.append(f"{year:04d}-{month:02d}")
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     return months or [props["datetime"][:7]]
+
+
+def dataset_lines() -> list:
+    """One line per dataset of the registry: its name, whether it is static (stored once)
+    or dated (ingested for a date range), and the first sentence of its adapter's
+    description (which may run over several lines of the docstring)."""
+    width = max(len(name) for name in REGISTRY)
+    out = []
+    for name, src in REGISTRY.items():
+        kind = "static" if getattr(src, "STATIC", False) else "dated"
+        opening = " ".join((src.__doc__ or "").strip().split("\n\n")[0].split())
+        title = opening.split(". ")[0].rstrip(".")
+        out.append(f"  {name:<{width}}  {kind:<6}  {title}")
+    return out
 
 
 def _report_open(dataset, say) -> None:
@@ -58,7 +74,10 @@ def _report_open(dataset, say) -> None:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="geovault")
+    ap.add_argument("--version", action="version", version=f"geovault {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("datasets", help="the datasets this version can ingest")
 
     p = sub.add_parser("ingest", help="fetch tiles covering an AOI or bbox")
     p.add_argument("--dataset", required=True, choices=list(REGISTRY))
@@ -104,6 +123,11 @@ def main(argv=None):
     p.add_argument("--workers", type=int, default=8, help="tiles encoded concurrently per month (default 8)")
 
     a = ap.parse_args(argv)
+
+    if a.cmd == "datasets":
+        for line in dataset_lines():
+            print(line)
+        return 0
 
     if a.cmd == "compact":
         done = compact(a.dataset)
@@ -198,8 +222,10 @@ def main(argv=None):
         _report_open(a.dataset, log.info)
         ncat = catalog.rebuild(a.dataset)
         log.info(f"  catalog updated: {ncat} rows")
-        log.info(f"done: {total} new tiles in {time.time() - t0:.0f}s")
-        return 0
+        log.info(f"done: {total} new tiles in {time.time() - t0:.0f}s"
+                 + (f", {writer.left_out} files, cells or tiles left out (re-run the same "
+                    f"command to fetch them)" if writer.left_out else ""))
+        return 2 if writer.left_out else 0
 
     if not (a.start and a.end):
         ap.error(f"{a.dataset} is time-varying: --start and --end are required")

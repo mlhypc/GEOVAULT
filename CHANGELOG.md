@@ -1,5 +1,150 @@
 # Changelog
 
+## 0.12.0 (2026-11-19)
+
+- New source `gem15`: GEM-15 version 1, Google's surface and terrain elevation models
+  at 15 m (experimental, CC BY 4.0, anonymous). Six bands, named as published: `dsm`,
+  `dsm_percentile_5`, `dsm_percentile_50`, `dsm_percentile_95`, `dsm_std` and `dtm`;
+  float32 metres above EGM96, NaN where there is no value; tiles of 256 pixels in the
+  UTM zone of the ground. The product comes as two files per 1 x 1 degree cell. A file
+  holds values about 1 km past its cell, and there neighbouring cells do not agree
+  (measured on the terrain model: 0.7 m in the median and 9.5 m at most across 35 E at
+  38.5 N, 0.1 to 0.3 m in the median at the corner 35 E, 39 N), so a tile on a cell
+  line takes every pixel from the cell its centre lies in and the strip a cell holds
+  past its own ground is not stored. A tile holds the cells of its own UTM zone, so no
+  ground is stored twice. A tile is stored once every cell it takes pixels from has
+  been opened or is known not to exist (the bucket answers 404); when a cell fails for
+  another reason the tile is left out, the run says so, and the same command fetches
+  it later. Checked against the source: the stored tiles over the corner of four cells
+  at 35 E, 39 N are equal, pixel for pixel, to the four files read directly.
+- `common.read_tile_window` takes the number of the band to read, and it and
+  `static_cog.ingest_assets` tell an empty tile and count valid pixels with
+  `common.observed`. With a nodata value of NaN the old tests (`== nodata`,
+  `!= nodata`) held for no pixel: a tile of nothing but NaN would have been stored and
+  every pixel counted as valid. No source before `gem15` has a nodata value of NaN, so
+  nothing stored changes.
+- A static ingest that left something out exits with 2, like a dated one with a failed
+  scene; it exited with 0, so a script could not tell that the run was not complete.
+  The adapters that can leave a file, a cell or a tile out (`static_cog.ingest_assets`,
+  `3dep_1m`, `gem15`) count it with the new `Writer.leave_out`, and the last line of
+  the run gives the number.
+- `catalog.rebuild` writes the catalog under a temporary name of its own and puts it in
+  place whole, so a reader sees the catalog of before or the new one and a rebuild
+  that fails leaves the one of before. Until now that was left to how DuckDB writes a
+  file that exists (through a `tmp_` file of its own, which a failed rebuild left
+  behind), and two rebuilds of one dataset at the same time, as at the end of two
+  ingests run side by side, took each other's file: two processes rebuilding
+  one catalog 40 times each lost 4 to 14 of their rebuilds, depending on the run, and
+  now lose none. Where a reader holds the catalog open (Windows
+  refuses the rename then) the rename is tried again for five seconds.
+- `reader.tiles_for_bbox` and `catalog.coverage` hand the band and the date to the
+  query as values; they were written into its text, so a name with a quote broke it.
+- New commands: `geovault datasets` lists the datasets of this version, one line each
+  (static or dated, and the first sentence of the adapter's description), and
+  `geovault --version`.
+- Packaging: `requests` is declared as a dependency (five adapters import it; it came
+  only by way of `pystac-client`). New extra `dev` (pytest). Project URLs and
+  classifiers. `pytest` without arguments collects `tests/` only.
+- `tests/test_cds_grids.py` is skipped without the `cds` extra; it failed at import.
+- The notes on single sources and the chapter on storage moved out of the README, word
+  for word, into `docs/sources.md` and `docs/storage.md` (README: from about 900 lines to about 320).
+  New: `docs/adding-a-source.md`, what the command line asks an adapter for. The
+  paragraph on credentials now names `cgls_ndvi300`, which needs a key pair as its row
+  in the source table already said.
+- A workflow runs the tests on pushes to `main` and on pull requests
+  (`.github/workflows/tests.yml`: Linux and Windows, Python 3.11 and 3.12).
+- Python 3.11 is the oldest supported version; the package said 3.10. The `pardig` and
+  `era5` extras could not be installed on 3.10 (zarr 3 needs 3.11), and nothing had
+  been run on it.
+- Tests: `tests/test_gem15.py`, 17 tests on files written the way the product lays its
+  cells out (a tile on a cell line, four cells in one tile, a zone line, the equator, a
+  cell the product does not have, a cell that does not answer or does not open, a read
+  that fails, a file off the lattice, a file ending inside a tile, cells whose value
+  differs from pixel to pixel, the exit code of the command);
+  `tests/test_catalog.py`, 7 tests; `tests/test_cli.py`, 3 tests; two more in
+  `tests/test_blob.py`, for a tile whose metadata names a pixel type (it is read by
+  GDAL, whatever the case of the name).
+
+## 0.11.0 (2026-11-19)
+
+- Reading a tile no longer opens it with GDAL. A tile is a small DEFLATE GeoTIFF, and
+  opening one costs more than its pixels do: 0.54 ms for a 50 x 50 float32 tile, of
+  which the pixels take 0.03 ms. A series at a point opens one tile per date, so on a
+  layer of many small tiles that was most of the read. `geovault.blob.decode`, which
+  `read_tile`, `mosaic`, `clip` and `series` now use, inflates the strips with zlib
+  and undoes the predictor with numpy. Per tile, best of three passes over stored
+  tiles:
+
+  | tile | with GDAL | now |
+  |---|---|---|
+  | 50 x 50 float32 | 0.54 ms | 0.03 ms |
+  | 60 x 60 uint8 | 1.66 ms | 0.02 ms |
+  | 100 x 100 float32 | 0.60 to 0.69 ms | 0.10 to 0.16 ms |
+  | 240 x 240 uint8 | 1.84 ms | 0.12 ms |
+  | 240 x 240 uint16 | 2.09 ms | 0.42 ms |
+  | 256 x 256 uint16 | 1.50 ms | 0.67 ms |
+  | 256 x 256 float32, predictor 3 | 2.16 ms | 1.10 ms |
+
+- What a read returns from a store this library wrote has not changed: the array is
+  the same bit for bit and the profile key for key. The profile of a kind of tile
+  (size, data type, nodata value, CRS, strip layout) is not rebuilt: the first tile of
+  each kind is opened with GDAL as well and its profile is kept for the tiles of that
+  kind that follow, with the transform of each tile taken from its tiepoint. That
+  first tile is decoded both ways, and a kind that does not come out as GDAL reads it
+  is left to GDAL. So is every GeoTIFF laid out in another way (tiles instead of
+  strips, another compression, several bands, an overview, big-endian or BigTIFF, a
+  rotated or south-up raster, pixels that stand for points). Checked on 52,046 tiles
+  of one store, of every band and CRS of its 20 datasets: none differs, and no kind
+  was left to GDAL.
+- A tile whose bytes were changed after it was written is not trusted: every strip
+  has to lie inside the blob and inflate to the rows it holds, and is not inflated
+  past them; a tag may be there once, in the field type it is written in. A tile that
+  fails any of this is read by GDAL, which raises what it raised before or returns
+  what it can read of it.
+- `mosaic` and `clip` read the tiles of a month file in one query. They ran one query
+  per tile, about 20 ms each, on a connection of its own. A date prefix no longer asks
+  the catalog twice. That query, which `series` runs as well, now lists the bands and
+  tile numbers it wants as values; handed over as lists to unnest they were joined to
+  the file, which took twice as long on most reads (37 against 15 ms for one tile of
+  a static file of 1.4 GB, 21 against 6 ms for 35 tiles of a month). On a stale
+  catalog `mosaic` and `clip` raise a `RuntimeError` that says to rebuild it, as
+  before, in the words `series` uses ("... catalog rows not found in ...").
+- `series` raises when a catalog row matches several stored tiles of one file, as
+  `read_tile`, `mosaic` and `clip` do; it returned one of them. No writer of the store
+  puts a key into a file twice.
+- Measured on one store, the old code and the new one after the other, the results
+  equal to the last value:
+
+  | read | tiles | before | after |
+  |---|---|---|---|
+  | series, `pardig_nrt` (50 x 50 float32, every 15 minutes) | 350,657 | 211 s | 20 s |
+  | series, `agera5` (100 x 100 float32, daily) | 6,842 | 10.3 s | 2.4 s |
+  | series, `chirps` (100 x 100 float32, daily) | 6,097 | 6.1 s | 2.0 s |
+  | series, `modis_lst` QC band (240 x 240 uint8) | 297 | 1.92 s | 0.44 s |
+  | series, `landsat` (256 x 256 uint16) | 843 | 3.4 s | 1.8 s |
+  | series, `s1` (256 x 256 float32) | 655 | 3.6 s | 1.3 s |
+  | series, `s2` 10 m (256 x 256 uint16) | 527 | 1.72 s | 0.80 s |
+  | mosaic, `modis_lst` QC band | 50 | 1.34 s | 0.24 s |
+  | mosaic, `s1` | 35 | 0.86 s | 0.37 s |
+  | mosaic, `s2` 10 m | 29 | 0.50 s | 0.09 s |
+  | mosaic, `s2` 20 m | 19 | 0.49 s | 0.28 s |
+  | mosaic, `landsat` | 9 | 0.15 s | 0.03 s |
+  | mosaic, `worldcover` (static, one file of 920 MB) | 9 | 0.19 s | 0.04 s |
+  | mosaic, `agera5` | 6 | 0.09 s | 0.03 s |
+  | mosaic, `3dep_1m` (static, one file of 1.4 GB) | 6 | 0.21 s | 0.07 s |
+  | mosaic, one tile of a static file | 1 | 0.03 to 0.04 s | the same |
+
+  The times of a run vary by a quarter with what else the machine does. What is left
+  of a series over large tiles is the query of each month file, and the decoding of
+  the whole tile where one pixel is wanted.
+- Tests: `tests/test_blob.py`, 92 tests (every data type with each predictor, tiles
+  of 1 to 500 pixels a side, six CRS and grids with six nodata values, scale and
+  offset, the layouts that go to GDAL, bytes that are no GeoTIFF, ten ways a tile can
+  be changed after it was written, a kind that does not come out as GDAL reads it),
+  each comparing the array and the profile with what rasterio returns, the later tile
+  of a kind with GDAL switched off; three tests in `tests/test_reader_mosaic.py` (the
+  connections a mosaic opens, a key twice in a file, a stale catalog).
+
 ## 0.10.3 (2026-11-17)
 
 - A tile across the antimeridian could not be found where it lies. Its WGS84 bounds

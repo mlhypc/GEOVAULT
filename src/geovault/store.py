@@ -152,9 +152,18 @@ class Writer:
         self.touched = set()                # (res, month date) groups with a part written by us
         self.acq_months = set()             # those of them that got tiles of an acquisition
         self.unmerged = set()               # acq months closed with merge=False, still to merge
+        self.left_out = 0                   # see leave_out()
         self._last_fetched_at = 0
         self._lock = threading.Lock()       # add() is called from concurrent scene workers
         self._flush_lock = threading.Lock() # one flush at a time; others keep buffering meanwhile
+
+    def leave_out(self, n: int = 1) -> None:
+        """A source says that n files, cells or tiles could not be fetched this run and
+        are still to come. Nothing is stored for them; the count is how the command line
+        knows the run was not complete (it exits with 2, and the same command fetches
+        them later)."""
+        with self._lock:
+            self.left_out += n
 
     def add(self, band, date, x, y, crs, res, tile_px, wgs84_bounds, nodata,
             cloud_pct, scene_id, blob: bytes, valid_px: int | None = None,
