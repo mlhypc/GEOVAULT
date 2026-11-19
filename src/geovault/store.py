@@ -116,7 +116,7 @@ def _write_sorted(con, rows_sql: str, path) -> None:
     cannot make a row group smaller than 2048 rows. Statistics go on STAT_COLS only and
     the tile bytes are not dictionary encoded. A write that fails leaves a file holding
     the groups written so far, so callers write to a temporary name and rename."""
-    reader = con.execute(
+    reader = con.sql(
         f"SELECT * FROM ({rows_sql}) ORDER BY band, date, x, y").to_arrow_reader(256)
     with pq.ParquetWriter(path, reader.schema, compression="zstd", compression_level=3,
                           write_statistics=STAT_COLS,

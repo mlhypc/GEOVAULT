@@ -7,9 +7,11 @@ overlapping AOIs share tiles and redrawing an AOI never invalidates stored data.
 
 import json
 
+import numpy as np
+import shapely
 from pyproj import Transformer
 from shapely.geometry import shape, box
-from shapely.ops import unary_union, transform as shp_transform
+from shapely.ops import unary_union
 
 
 def load_geojson(path):
@@ -45,10 +47,16 @@ def tile_filter(aoi):
     return f
 
 
+def _moved(geom, transformer):
+    """A geometry with every vertex passed through a pyproj transformer."""
+    def move(xy):
+        return np.column_stack(transformer.transform(xy[:, 0], xy[:, 1]))
+    return shapely.transform(geom, move)
+
+
 def to_crs(geom, crs):
     """WGS84 shapely geometry -> native CRS (for read-time clipping)."""
-    tr = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
-    return shp_transform(tr.transform, geom)
+    return _moved(geom, Transformer.from_crs("EPSG:4326", crs, always_xy=True))
 
 
 def point_buffer(lon: float, lat: float, meters: float):
@@ -60,4 +68,4 @@ def point_buffer(lon: float, lat: float, meters: float):
     inv = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
     x, y = fwd.transform(lon, lat)
     b = box(x - meters, y - meters, x + meters, y + meters)
-    return shp_transform(inv.transform, b)
+    return _moved(b, inv)

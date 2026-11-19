@@ -326,14 +326,20 @@ def a_strip_that_inflates_to_far_more(data):
     return with_strips(data, [zlib.compress(bytes(50_000_000))] + [b""] * (len(strip_table(data)[0]) - 1))
 
 
+GDAL_SAYS = (np.full(DAMAGED, 7, "uint16"), {"driver": "GTiff"})
+
+
 @pytest.mark.parametrize("damage", [
     one_strip_with_every_row, first_strip_a_row_too_long, last_strip_past_the_end,
-    first_strip_damaged, strips_in_another_order, second_tiepoint, second_strip_table,
-    offsets_as_doubles, sizes_as_doubles, a_strip_that_inflates_to_far_more])
-def test_a_tile_of_a_known_kind_that_is_not_what_its_kind_says(damage):
+    first_strip_damaged, second_tiepoint, second_strip_table, offsets_as_doubles,
+    sizes_as_doubles, a_strip_that_inflates_to_far_more])
+def test_a_damaged_tile_is_handed_to_gdal(monkeypatch, damage):
     """Tiles whose bytes were changed after they were written, each of a kind that is
-    read here: whatever GDAL makes of one (an error, or what it can read of it) is what
-    comes back, for the first tile of the kind and for a later one."""
+    read here. None of them is read here: GDAL is asked, for the first tile of a kind
+    and for a later one, and what it answers (an error, or what it can read of the
+    tile) is what comes back. GDAL itself is not run on them in this test: what it
+    makes of such bytes differs between its builds (one raises where another returns
+    what was in its buffer)."""
     good = tile(pixels("uint16", DAMAGED, seed=1))
     bad = damage(tile(pixels("uint16", DAMAGED, seed=2), x=0.0, y=0.0))
     assert len(strip_table(good)[0]) == DAMAGED[0] // STRIP_ROWS
@@ -342,13 +348,29 @@ def test_a_tile_of_a_known_kind_that_is_not_what_its_kind_says(damage):
         if known:
             blob.decode(good)
             assert None not in blob._kinds.values()
-        try:
-            gdal(bad)
-        except Exception as e:
-            with pytest.raises(type(e)):
-                blob.decode(bad)
-        else:
-            assert_as_gdal(blob.decode(bad), bad)
+        asked = []
+        with monkeypatch.context() as m:
+            m.setattr(blob, "_decode_gdal", lambda data: asked.append(data) or GDAL_SAYS)
+            arr, profile = blob.decode(bad)
+        assert arr is GDAL_SAYS[0] and profile is GDAL_SAYS[1] and asked == [bad]
+        if not known:                       # a damaged first tile teaches no kind
+            assert set(blob._kinds.values()) <= {None}
+
+    def refuse(data):
+        raise rasterio.errors.RasterioIOError("what GDAL says of the tile")
+
+    monkeypatch.setattr(blob, "_decode_gdal", refuse)
+    with pytest.raises(rasterio.errors.RasterioIOError, match="what GDAL says"):
+        blob.decode(bad)
+
+
+def test_strips_stored_in_another_order_are_read_here(monkeypatch):
+    """Where the strips lie in the blob is for the strip table to say."""
+    good = tile(pixels("uint16", DAMAGED, seed=1))
+    other = strips_in_another_order(tile(pixels("uint16", DAMAGED, seed=2), x=0.0, y=0.0))
+    assert strip_table(other)[0] != sorted(strip_table(other)[0])
+    assert_as_gdal(blob.decode(good), good)
+    assert_as_gdal(decode_without_gdal(monkeypatch, other), other)
 
 
 def test_a_strip_is_not_inflated_past_the_size_of_its_rows():

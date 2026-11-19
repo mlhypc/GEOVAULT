@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.12.1 (2026-11-19)
+
+What the first run of the test workflow found, on the newest versions of the
+dependencies (shapely 2.2, DuckDB 2.0) and on Linux.
+
+- No warning from the library under shapely 2.2 and DuckDB 2.0. Every `clip` and every
+  ingest of a point raised a `DeprecationWarning` (`shapely.ops.transform`; the AOI
+  helpers now use `shapely.transform`), and every write of a store file a
+  `UserWarning` (an Arrow reader asked of a DB-API result; it is now asked of
+  `con.sql`). What they return has not changed: the reprojected geometries are equal
+  vertex for vertex, and the store files are written by the same reader.
+- The tests of damaged tiles no longer run GDAL on the damaged bytes. They compared
+  what `blob.decode` returns with a second read by GDAL, and what GDAL makes of such a
+  tile depends on its build: on Windows it raises, on Linux two reads of one tile came
+  back with different bytes, and one job did not come back at all. The tests now check
+  what the library is responsible for: a damaged tile is not read here, GDAL is asked,
+  and its answer or its error is what comes back. Strips stored in another order, which
+  is a valid tile, have a test of their own.
+- The workflow stops a job after 20 minutes and prints where a test stands that takes
+  more than five.
+
 ## 0.12.0 (2026-11-19)
 
 - New source `gem15`: GEM-15 version 1, Google's surface and terrain elevation models
