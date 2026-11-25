@@ -28,7 +28,6 @@ Band: `precip` (mm/day). cloud_pct is None (not a satellite product).
 """
 
 import gzip
-import io
 import re
 from datetime import date as _date, timedelta
 
@@ -108,13 +107,14 @@ def _prelim_keys_in_store(dataset, day) -> set:
     """(band, date, crs, x, y) of this day's tiles that are stored from the prelim stream.
     A final item must re-fetch those, so they are removed from skip_keys."""
     from .. import catalog
+    from ..store import scan
     import duckdb
     p = catalog.path(dataset)
     if not p.exists():
         return set()
     con = duckdb.connect()
     rows = con.execute(
-        f"SELECT band, date, '{CRS}', x, y FROM read_parquet('{p.as_posix()}') "
+        f"SELECT band, date, '{CRS}', x, y FROM {scan([p])} "
         f"WHERE date = ? AND scene_id = ?", [day.isoformat(), SCENE_PRELIM]).fetchall()
     con.close()
     return set(rows)

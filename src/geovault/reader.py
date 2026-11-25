@@ -19,6 +19,7 @@ import numpy as np
 from . import catalog
 from .blob import decode as _decode
 from .sources.common import observed as _observed
+from .store import scan
 
 
 def tiles_for_bbox(dataset, bbox, band=None, date=None) -> list:
@@ -37,7 +38,7 @@ def tiles_for_bbox(dataset, bbox, band=None, date=None) -> list:
         args.append(f"{date}%")
     con = duckdb.connect()
     cur = con.execute(
-        f"SELECT * FROM read_parquet('{p.as_posix()}') "
+        f"SELECT * FROM {scan([p])} "
         f"WHERE {' AND '.join(where)} ORDER BY band, date, x, y", args)
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -50,7 +51,7 @@ def read_tile(row):
     The CRS and the acquisition are part of the tile key: UTM tile numbers restart in
     every zone, so the same (x, y) can be stored twice in one file, for ground in two
     zones, and a date can hold the same tile from two overpasses."""
-    sql = (f"SELECT data FROM read_parquet('{Path(row['file']).as_posix()}') "
+    sql = (f"SELECT data FROM {scan([row['file']])} "
            f"WHERE band=? AND date=? AND x=? AND y=? "
            f"AND crs IS NOT DISTINCT FROM ? AND acq IS NOT DISTINCT FROM ?")
     args = [row["band"], row["date"], row["x"], row["y"], row["crs"], row["acq"]]
@@ -334,7 +335,7 @@ def _blobs_by_row(rows):
             listed = lambda values: ", ".join("?" * len(values))
             cur = con.execute(
                 f"SELECT band, date, x, y, crs, acq, scene_id, data "
-                f"FROM read_parquet('{Path(f).as_posix()}') "
+                f"FROM {scan([f])} "
                 f"WHERE band IN ({listed(bands)}) AND date BETWEEN ? AND ? "
                 f"AND x IN ({listed(xs)}) AND y IN ({listed(ys)})",
                 [*bands, min(dates), max(dates), *xs, *ys])

@@ -22,7 +22,6 @@ https://eodata-s3keysmanager.dataspace.copernicus.eu after a free CDSE registrat
 goes through GDAL's /vsis3/ with the CDSE endpoint, so rasterio needs nothing extra.
 """
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np

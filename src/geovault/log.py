@@ -14,7 +14,6 @@ import sys
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 
 def setup(dataset: str, to_file: bool = True) -> logging.Logger:

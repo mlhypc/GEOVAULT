@@ -9,6 +9,7 @@ data/
   catalog/<dataset>.parquet.<id>.tmp              a catalog being rebuilt; one left by a killed run is never read, delete it
   store/dataset=<d>/**/*.parquet.tmp              a write in progress; one left by a killed run is never read, delete it
   store/dataset=<d>/**/*.parquet.old              a sealed month moved aside for its new file; never delete one whose month has no sealed file (see Write pattern)
+  store/dataset=<d>/**/*.parquet.lock             a month being compacted or re-encoded; one left by a killed run locks nothing, delete it or leave it
   cache/<dataset>/<archive folder>/               downloaded source objects (PARDIG archives); delete when no ingest runs
   logs/<dataset>_<timestamp>.log                  one log per ingest run
 ```
@@ -108,9 +109,19 @@ sharing it for deletion, keeps reading the old file, which is moved aside as
 file handle, pyarrow) makes the compaction fail and leaves the month as it was. A
 sealed file that stays aside, because the run was killed between the two renames or
 the file could not be moved back, leaves its month without a sealed file until
-`geovault compact` puts it back (delete the lock file of a killed run first). Files
-are not synced to disk before they are renamed: a power cut right after a compaction
-can cost the month.
+`geovault compact` puts it back. Files are not synced to disk before they are
+renamed: a power cut right after a compaction can cost the month.
+
+Only one process compacts or re-encodes a month at a time. While it does, it keeps
+the file `r<res>.parquet.lock` open and locked through the operating system, and it
+deletes the file when it is done. The operating system drops the lock when the
+process ends, however it ends, so a lock file left behind by a killed run locks
+nothing: the next compaction or re-encoding of that month takes the lock and deletes
+the file, and deleting it by hand does no harm. The file holds the number of the
+process that has the lock. A lock file that cannot be opened or locked for another
+reason (no right to write in the folder, a file system that keeps no locks) is
+reported as an error; the data folder has to be on a file system that keeps such
+locks, as local disks do.
 
 ## File layout (row groups)
 

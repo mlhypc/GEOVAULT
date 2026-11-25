@@ -31,7 +31,6 @@ Values are stored RAW in ERA5 units (K, m of water, J m-2 accumulated over the h
 m3 m-3). Nothing is rescaled. nodata -9999 marks cells the store has no value for.
 """
 
-import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date as _date, datetime, timedelta
 
@@ -147,13 +146,14 @@ def _prelim_keys_in_store(dataset, day: _date) -> set:
     """(band, date, crs, x, y) of this day's hours stored from ERA5T; a final item must
     re-fetch those."""
     from .. import catalog
+    from ..store import scan
     import duckdb
     p = catalog.path(dataset)
     if not p.exists():
         return set()
     con = duckdb.connect()
     rows = con.execute(
-        f"SELECT band, date, '{CRS}', x, y FROM read_parquet('{p.as_posix()}') "
+        f"SELECT band, date, '{CRS}', x, y FROM {scan([p])} "
         f"WHERE date LIKE ? AND scene_id = ?", [day.isoformat() + "%", SCENE_PRELIM]).fetchall()
     con.close()
     return set(rows)

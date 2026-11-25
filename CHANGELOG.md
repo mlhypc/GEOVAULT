@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.12.2 (2026-11-25)
+
+Three ways a store could be read wrongly or left stuck, none of which needs anything
+re-ingested.
+
+- A lock file left behind by a killed run no longer blocks its month. Until now the
+  lock was the file itself, so it stayed when the process that made it died: the
+  compaction at the end of an ingest skipped that month, `geovault compact` waited
+  ten minutes for it and gave up, and the file had to be deleted by hand. The file is
+  now locked through the operating system, which drops the lock when the process
+  ends, however it ends. A lock file left behind locks nothing; the next compaction
+  or re-encoding of its month deletes it. When a month could not be sealed because
+  another process holds it, the message names the lock file, which holds the number
+  of that process, and no longer asks for a file to be deleted. A lock file that
+  cannot be opened or locked for any other reason is an error, not a busy month.
+  Do not run this version and an older one on the same data folder at the same time:
+  this one does not see the lock of the older one.
+- The files of the data folder are the files read, whatever its path holds. The path
+  of a file goes into a query as text, and three kinds of path were read wrongly:
+  - with a quote in it (`C:/Users/O'Brien/vault`), writing a part worked, but the skip
+    set of the next ingest, compaction, the catalog and every read failed with a SQL
+    syntax error;
+  - with `[`, `*` or `?` in it, DuckDB took the path for a pattern. A data folder
+    `v[1]` next to a folder `v1` read the sealed files and the catalog of `v1`: an
+    ingest skipped tiles it did not have, and a compaction replaced the month with the
+    tiles of the other folder;
+  - below a folder named like `band=x`, every tile was read back with that value for
+    its band.
+  Every query now reads through `store.scan`, the adapters as well.
+- Nine imports nothing used are gone.
+
 ## 0.12.1 (2026-11-19)
 
 What the first run of the test workflow found, on the newest versions of the

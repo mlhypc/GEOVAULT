@@ -23,7 +23,6 @@ The processing baseline changed from 002 to 003 in 2026 (visible in the product 
 Extras: `pip install -e .[syn]` (h5py, fsspec, aiohttp).
 """
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np

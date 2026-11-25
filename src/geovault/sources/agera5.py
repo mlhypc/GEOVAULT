@@ -39,7 +39,7 @@ import numpy as np
 
 from ..grid import Grid
 from . import common
-from .era5land import ANCHOR, CRS, NODATA, RES, TILE_PX, TOL, client, grid_for as _grid, tile_centres
+from .era5land import CRS, NODATA, RES, TILE_PX, TOL, client, grid_for as _grid, tile_centres
 
 DATASET = "sis-agrometeorological-indicators"
 VERSION = "2_0"

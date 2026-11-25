@@ -30,7 +30,6 @@ Terra scene 2026-08-28).
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 
 import planetary_computer as pc
 import rasterio

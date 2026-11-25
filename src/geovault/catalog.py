@@ -13,7 +13,7 @@ from pathlib import Path
 
 import duckdb
 
-from .store import ROOT, STORE, scan
+from .store import ROOT, STORE, scan, sql_path
 
 CATALOG = ROOT / "catalog"
 
@@ -57,8 +57,8 @@ def rebuild(dataset: str) -> int:
                 "NULL file, NULL crs, NULL acq, NULL valid_px WHERE false")
     con = duckdb.connect()
     try:
-        con.execute(f"COPY ({rows}) TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-        n = con.execute(f"SELECT count(*) FROM read_parquet('{tmp.as_posix()}')").fetchone()[0]
+        con.execute(f"COPY ({rows}) TO {sql_path(tmp)} (FORMAT PARQUET, COMPRESSION ZSTD)")
+        n = con.execute(f"SELECT count(*) FROM {scan([tmp])}").fetchone()[0]
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -97,7 +97,7 @@ def coverage(dataset: str, bbox=None, date=None) -> list:
         args.append(f"{date}%")
     rows = con.execute(
         f"SELECT date, band, count(*) tiles, round(avg(cloud_pct), 1) cloud "
-        f"FROM read_parquet('{p.as_posix()}') WHERE {' AND '.join(where)} "
+        f"FROM {scan([p])} WHERE {' AND '.join(where)} "
         f"GROUP BY date, band ORDER BY date, band", args).fetchall()
     con.close()
     return rows

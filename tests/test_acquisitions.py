@@ -5,6 +5,7 @@ tiles, not one. Two scenes of one overpass that each hold part of a tile are mer
 one tile."""
 
 import io
+import os
 from pathlib import Path
 
 import duckdb
@@ -241,21 +242,27 @@ def test_compact_reports_only_what_it_sealed(vault):
     add(w, tile(100), "scene_a", "orbit_1")
     w.flush()
     assert store.open_months("d") == [(float(RES), DATE[:7] + "-01")]
-    lock = store.month_dir("d", DATE) / f"r{RES}.parquet.lock"
-    lock.write_text("stale")                       # as a crashed compaction leaves it
+    lock = store.lock_file("d", RES, DATE)
+    held = store._MonthLock(lock, wait=False)
+    assert held.acquire()                          # as another compaction holds the month
     monkey = store._MonthLock.__init__.__defaults__
     store._MonthLock.__init__.__defaults__ = (0.2,)
     try:
         assert store.compact("d") == []
+        assert store.open_months("d") != []
+        lines = []
+        from geovault import cli
+        cli._report_open("d", lines.append)
+        assert "2026-03 r10" in lines[0] and len(lines) == 2
+        assert "another geovault process" in lines[1] and str(lock) in lines[1]
+        assert lock.read_text() == str(os.getpid())
     finally:
         store._MonthLock.__init__.__defaults__ = monkey
-    assert store.open_months("d") != [] and store.lock_file("d", RES, DATE) == lock
-    lines = []
-    from geovault import cli
-    cli._report_open("d", lines.append)
-    assert "2026-03 r10" in lines[0] and str(lock) in lines[1] and "delete the lock" in lines[2]
-    lock.unlink()
+        held.release()
     assert store.compact("d") == [(float(RES), DATE[:7] + "-01")] and store.open_months("d") == []
+    lines = []
+    cli._report_open("d", lines.append)
+    assert lines == []
 
 
 # --- what a scene still has to fetch ----------------------------------------------------------
@@ -538,9 +545,12 @@ def test_a_month_another_process_holds_stays_owed_a_merge(vault):
     add(w, tile(200, EAST), "scene_b", "orbit_1")
     lock = store.lock_file("d", RES, DATE)
     lock.parent.mkdir(parents=True)
-    lock.write_text("busy")
-    w.close()                                      # cannot merge now
-    assert len(stored()) == 2
-    lock.unlink()
+    held = store._MonthLock(lock, wait=False)
+    assert held.acquire()
+    try:
+        w.close()                                  # cannot merge now
+        assert len(stored()) == 2
+    finally:
+        held.release()
     w.close()                                      # nothing new, but the merge is still owed
     assert len(stored()) == 1

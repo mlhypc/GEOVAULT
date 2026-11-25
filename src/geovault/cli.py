@@ -60,14 +60,14 @@ def _report_open(dataset, say) -> None:
     say(f"  {len(left)} (res, month) groups are not sealed (open part files, or a sealed "
         f"file left aside): "
         + ", ".join(f"{date[:7] or 'static'} r{int(res)}" for res, date in left))
-    locks = [_store.lock_file(dataset, res, date) for res, date in left]
-    locks = [str(f) for f in locks if f.exists()]
+    # A compaction has just asked for each of these months. One that still has a lock
+    # file is held by another process, whose number the file holds.
+    locks = [f for f in (_store.lock_file(dataset, res, date) for res, date in left) if f.exists()]
     if locks:
-        say("  another process is compacting them, or a crash left these lock files behind: "
-            + ", ".join(locks))
-        say(f"  when no geovault process is running, delete the lock files and run "
-            f"`geovault compact {dataset}`")
-    else:
+        say("  another geovault process is compacting or re-encoding some of them right now "
+            f"(its number is in {', '.join(str(f) for f in locks)}): "
+            f"run `geovault compact {dataset}` once it has finished")
+    if len(locks) < len(left):
         say(f"  a file of theirs was held open by another program, or a run was interrupted: "
             f"run `geovault compact {dataset}` once nothing holds them")
 

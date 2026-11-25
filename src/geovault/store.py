@@ -21,6 +21,7 @@ Design notes (from reverse-engineering Google Earth's tile system):
   catalog (catalog.py) so readers never glob the store to ask what exists.
 """
 
+import errno
 import os
 import threading
 import time
@@ -86,10 +87,29 @@ def month_files(dataset: str, res: float, date: str) -> list:
     return sorted(d.glob(f"r{int(res)}.parquet")) + sorted(d.glob(f"r{int(res)}.part-*.parquet"))
 
 
+def sql_path(path) -> str:
+    """A file path as a SQL string literal, a quote in it doubled: the name of a file a
+    query writes. A file a query reads goes through `scan`."""
+    return "'" + Path(path).as_posix().replace("'", "''") + "'"
+
+
 def scan(files, filename: bool = False) -> str:
-    """SQL source over a list of store files; filename: add the path of each row's file."""
-    lst = ", ".join(f"'{Path(f).as_posix()}'" for f in files)
-    return f"read_parquet([{lst}]{', filename=true' if filename else ''})"
+    """SQL source over a list of store or catalog files; filename: add the path of each
+    row's file. The files named are the files read, whatever their path holds:
+
+    - DuckDB reads a path as a pattern, and `[`, `*` and `?` are legal in the name of a
+      folder. A data folder `v[1]` next to a folder `v1` was read as `v1`. Each of the
+      three is written as a class of one character (`[[]`), which matches only itself.
+    - A folder named `key=value` anywhere above a file would turn into a column of that
+      name, and replace a column of the same name (`band=x`). The columns of a file are
+      the ones stored in it."""
+    def pattern(f):
+        text = Path(f).as_posix()
+        return sql_path("".join(f"[{c}]" if c in "[*?" else c for c in text))
+
+    lst = ", ".join(pattern(f) for f in files)
+    return (f"read_parquet([{lst}], hive_partitioning=false"
+            f"{', filename=true' if filename else ''})")
 
 
 def _row_groups(batches):
@@ -369,35 +389,115 @@ class Writer:
         return written
 
 
+# The byte of a lock file the lock is held on: far past anything a program reads. Windows
+# refuses a read that reaches a byte another handle holds locked, and the start of the
+# file holds a number that is there to be read.
+_LOCK_BYTE = 1 << 40
+
+# How long Windows is asked again for a lock file it refuses to open. It refuses while a
+# file is being deleted, which is over in an instant, and for a file or a folder the user
+# may not write to, which is not.
+_OPEN_PATIENCE = 1.0
+
+
+def _os_lock(fd) -> bool:
+    """Take the operating system's exclusive lock on an open lock file, without waiting.
+    False when another open handle holds it, in this process or any other. Any other
+    failure is raised: a file system that keeps no locks must not look like a month
+    that is busy."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, _LOCK_BYTE, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EAGAIN):
+            return False
+        raise
+    return True
+
+
 class _MonthLock:
-    """Exclusive lock file next to the month's files. wait=False -> acquire() returns False at once
-    when another process holds it; wait=True blocks (polling) until it is free or `timeout` passes."""
+    """Exclusive lock on a (res, month): a lock of the operating system on a file next
+    to the month's files, held for as long as the file is open. A process that dies
+    gives the lock up with its file handle, whatever killed it, so a lock file left
+    behind by a killed run locks nothing: whoever asks next takes it. The file holds
+    the number of the process that has the lock, for a person to read.
+
+    wait=False -> acquire() returns False at once when another process holds the lock;
+    wait=True blocks (polling) until it is free or `timeout` passes. A lock file that
+    cannot be opened or locked for any other reason raises."""
 
     def __init__(self, path, wait: bool, timeout: float = 600.0):
         self.path, self.wait, self.timeout, self.fd = path, wait, timeout, None
 
     def acquire(self) -> bool:
-        import os, time
+        t0 = time.time()
+        while True:
+            if self._take():
+                return True
+            if not self.wait or time.time() - t0 > self.timeout:
+                return False
+            time.sleep(0.5)
+
+    def _open(self) -> int:
         t0 = time.time()
         while True:
             try:
-                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(self.fd, str(os.getpid()).encode())
-                return True
-            except FileExistsError:
-                if not self.wait or time.time() - t0 > self.timeout:
+                return os.open(self.path, os.O_CREAT | os.O_RDWR)
+            except PermissionError:
+                if os.name != "nt" or time.time() - t0 > _OPEN_PATIENCE:
+                    raise
+                time.sleep(0.02)
+
+    def _take(self) -> bool:
+        for _ in range(5):
+            fd = self._open()
+            try:
+                if not _os_lock(fd):
                     return False
-                time.sleep(0.5)
+                # The holder before deletes the file as it lets go. A lock on a file that
+                # is no longer the one at this path excludes nobody, so it is given back
+                # and the file now at the path is asked for.
+                try:
+                    same = os.path.samestat(os.fstat(fd), os.stat(self.path))
+                except FileNotFoundError:
+                    same = False
+                if same:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.ftruncate(fd, 0)
+                    os.write(fd, str(os.getpid()).encode())
+                    self.fd, fd = fd, None
+                    return True
+            finally:
+                if fd is not None:          # not taken: closing the file gives the lock back
+                    os.close(fd)
+        return False
 
     def release(self):
-        import os
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+        if self.fd is None:
+            return
+        fd, self.fd = self.fd, None
+        # The file goes with the lock. Windows does not delete a file that is open, so
+        # there it is closed first; one a process waiting for the lock has opened
+        # meanwhile stays, as its lock file. Elsewhere it is deleted while the lock is
+        # still held: closed first, a waiting process could lock the file in the instant
+        # before it is deleted, and the next one would lock a new file beside it. A lock
+        # file that cannot be deleted stays and locks nothing.
+        try:
+            if os.name == "nt":
+                os.close(fd)
+                fd = None
             try:
                 os.unlink(self.path)
-            except FileNotFoundError:
+            except OSError:
                 pass
+        finally:
+            if fd is not None:
+                os.close(fd)
 
 
 def _has_split_tiles(files) -> bool:
@@ -417,8 +517,7 @@ def _resolved(src: str) -> str:
     one age (two processes writing in the same millisecond, a part left beside the month
     that already holds it) are told apart as Writer.add does it: the fuller one, then
     the smaller scene id; then the smaller blob, which is a re-encoded tile next to its
-    old encoding. Columns are selected by name, so the hive column DuckDB adds for
-    `dataset=` stays out."""
+    old encoding."""
     cols = ", ".join(COLS)
     return (f"(SELECT {cols} FROM (SELECT {cols}, row_number() OVER (PARTITION BY {KEY}, "
             f"CASE WHEN acq IS NULL THEN NULL ELSE scene_id END "
@@ -666,8 +765,8 @@ def months(dataset: str) -> list:
 
 
 def lock_file(dataset: str, res: float, date: str) -> Path:
-    """The lock a compaction holds on a (res, month). One left behind by a crash keeps
-    the month from being compacted until it is deleted."""
+    """The lock file of a (res, month): the file a compaction of the month holds
+    locked while it runs (_MonthLock)."""
     return month_dir(dataset, date) / f"r{int(res)}.parquet.lock"
 
 
