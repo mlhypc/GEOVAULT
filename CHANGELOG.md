@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.13.0 (2026-11-25)
+
+Pixels out of the vault without Python, and a check of what a vault holds. Nothing
+stored changes and nothing has to be re-ingested.
+
+- `geovault export` writes one band of one date over an area as a GeoTIFF
+  (`geovault.export.geotiff`). The area is a `--bbox`, a `--geojson` polygon or a
+  `--point` with a `--buffer`. The file is in the CRS and on the pixel grid the tiles
+  are stored in, so nothing is resampled, and covers the pixels that touch the bounds
+  of the area, as far as tiles are stored there. A pixel without a value holds the
+  band's nodata value, and a band that has none gets a mask inside the file. The scale
+  and offset a source documents (Landsat) are set on the band, and the stored numbers
+  are written as they are. `--date` takes a prefix for a composite and is left out
+  only for a static dataset; `--acq` names the overpass when a date holds two. The
+  file is moved into place when it is whole, so a failure leaves no half-written file.
+- `geovault series` writes the stored values of one or more bands at a point through
+  time as CSV (`geovault.export.series_csv`), to `--out` or to standard output: `band,
+  date, value, cloud_pct, acq, crs, scene_id`. A float32 value is written with the
+  digits that tell it apart from its neighbours (`0.1`), not with those of the float64
+  it becomes in Python.
+- Both commands exit with 0 when they wrote something, with 1 when nothing is stored
+  there, and with 2 for a dataset, a band or an acquisition that does not exist, for a
+  dated dataset asked for without a date, and for a file that cannot be read or
+  written. The Python functions raise `ValueError` for the same.
+- `geovault verify <dataset>` (`geovault.verify.verify`) checks a dataset and writes
+  nothing: every store file opens, has the columns of this version and can be read;
+  every row lies in the file of its month and resolution; no tile is stored twice; no
+  part file or sealed month left aside waits for a compaction; no other Parquet file
+  lies in the dataset's folder; and the catalog lists exactly what the store holds,
+  with the same values, and names the files of this data folder. `--deep` reads every
+  tile as well and compares it with its row: the size of the blob, the size of the
+  tile, its pixel size, its nodata value, the EPSG code of its CRS, its number of
+  observed pixels, and whether it lies where its tile number says. `--date` narrows
+  the check to a year or a month. Exit code 0 when nothing is wrong; a finding names
+  the command that puts it right where there is one. Files are read through DuckDB, so
+  verify does not get in the way of a compaction running beside it. See
+  [Checking a store](docs/storage.md#checking-a-store).
+- `geovault.blob.check` reads a tile without GDAL and says what is wrong with one that
+  is not whole (`blob.BadTile`): not a TIFF, cut short, not laid out as the encoder
+  writes a tile, of another size than its row says, or strips that do not hold the
+  rows its size calls for. It is what the deep check reads with, so a damaged tile is
+  never handed to GDAL, whose answer to one depends on its build. A header that names
+  more than a gigabyte of pixels is not read by `blob.decode` either.
+- `store.scan` takes `row_number=True` for the place of each row in its file.
+- The command line of `ingest` is tested down to the store with sources that fetch
+  nothing: a second run that skips what is stored, `--dry-run`, a scene that fails and
+  is fetched by the next run, the three ways to give an area, a static source and its
+  exit code 2, and the commands that look after a store.
+
 ## 0.12.2 (2026-11-25)
 
 Three ways a store could be read wrongly or left stuck, none of which needs anything

@@ -123,6 +123,50 @@ reason (no right to write in the folder, a file system that keeps no locks) is
 reported as an error; the data folder has to be on a file system that keeps such
 locks, as local disks do.
 
+## Checking a store
+
+`geovault verify <dataset>` (`geovault.verify.verify` from Python) reads a dataset and
+says what is wrong with it. It writes nothing and takes no lock, and it reads every
+file through DuckDB, which lets a compaction replace a file that is being read: verify
+can run beside an ingest. It then reports the store of that moment, with the part
+files of that ingest as open, and when a file goes away while it is read it says so
+and asks to be run again.
+
+Without `--deep` it reads file footers, the columns of every row but the tiles, and
+the catalog, which takes seconds (46 s for 21 datasets, 4.5 million tiles in 42 GB, on
+a laptop SSD):
+
+| Finding | What it means | What puts it right |
+|---|---|---|
+| a file cannot be opened, or cannot be read | the file is cut short, or a page of it is damaged | delete the file, `geovault rebuild-catalog`, ingest its month again |
+| a file does not have the columns of this version | it was written by another version | ingest the dataset again |
+| a Parquet file that is not of the store | a copy or a file put there by hand; the catalog lists its rows | move it away, `geovault rebuild-catalog` |
+| open part files | an ingest was interrupted, or is running | `geovault compact` |
+| a sealed month left aside with nothing in its place | a compaction was killed between two renames | `geovault compact` |
+| rows of another month or resolution in a file | a file was moved or renamed by hand | move it back |
+| tiles in more than one row, in a month with open parts | a re-fetched tile, or scenes of one overpass not merged yet | `geovault compact` |
+| tiles in more than one row of a sealed month | scenes of one overpass that could not be merged, or a file changed by hand | no command; `--deep` says which tiles are not whole |
+| rows without a size, a band, a tile number | a file changed by hand | ingest its month again |
+| the catalog is missing, stale, or names the files of another folder | the store changed after the catalog was built, or the data folder was moved | `geovault rebuild-catalog` |
+
+`--deep` also reads every tile and compares it with its row: the size of the blob,
+the size of the tile in pixels, its pixel size, its nodata value, the EPSG code of its
+CRS, its number of observed pixels, and whether it lies where its tile number says. A
+tile that is not a TIFF, is cut short, is not laid out as the encoder writes a tile or
+does not inflate to the rows its size calls for is named with its band, date and tile
+number. A stored tile is never fetched again, so to replace one: delete its month file,
+run `geovault rebuild-catalog` and ingest the month again. The tiles are read without
+GDAL (`geovault.blob.check`), so a damaged one is found there and never handed on: what
+GDAL makes of a damaged tile depends on its build. Reading takes minutes: 10 minutes
+for the same 42 GB, of which 3 for the 2.8 million small tiles of one precipitation
+layer, whose time goes into their number and not into their bytes.
+
+`--date 2025-07` narrows the checks to the month files the prefix names, as whole
+files, and the deep check to the tiles of the dates it names. A row of those dates
+that lies in the file of another month is then not seen. Files an interrupted run left
+behind (`.parquet.tmp`, lock files) are listed as notes: they are never read and can
+be deleted.
+
 ## File layout (row groups)
 
 A month file is sorted (band, date, x, y) and cut into row groups: a group ends once

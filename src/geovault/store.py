@@ -93,9 +93,10 @@ def sql_path(path) -> str:
     return "'" + Path(path).as_posix().replace("'", "''") + "'"
 
 
-def scan(files, filename: bool = False) -> str:
+def scan(files, filename: bool = False, row_number: bool = False) -> str:
     """SQL source over a list of store or catalog files; filename: add the path of each
-    row's file. The files named are the files read, whatever their path holds:
+    row's file; row_number: add `file_row_number`, the place of each row in its file. The
+    files named are the files read, whatever their path holds:
 
     - DuckDB reads a path as a pattern, and `[`, `*` and `?` are legal in the name of a
       folder. A data folder `v[1]` next to a folder `v1` was read as `v1`. Each of the
@@ -109,7 +110,8 @@ def scan(files, filename: bool = False) -> str:
 
     lst = ", ".join(pattern(f) for f in files)
     return (f"read_parquet([{lst}], hive_partitioning=false"
-            f"{', filename=true' if filename else ''})")
+            f"{', filename=true' if filename else ''}"
+            f"{', file_row_number=true' if row_number else ''})")
 
 
 def _row_groups(batches):

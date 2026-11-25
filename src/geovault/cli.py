@@ -3,6 +3,9 @@
   geovault ingest --dataset s2 --geojson parcel.geojson --start 2024-06-01 --end 2026-06-01
   geovault ingest --dataset s2 --bbox 35.30 36.71 35.33 36.73 --start ... --end ... [--cloud-max 80]
   geovault coverage s2 [--bbox W S E N] [--date 2024-06]
+  geovault export --dataset s2 --band B4 --date 2025-07-14 --geojson parcel.geojson --out b4.tif
+  geovault series --dataset s2 --bands B4 B8 --point 36.735 35.325 --out point.csv
+  geovault verify s2 [--deep]       # is what is stored whole, does the catalog list it
   geovault compact s2
   geovault reencode agera5          # re-compress stored tiles with the current encoder (lossless)
   geovault rebuild-catalog s2
@@ -13,8 +16,10 @@ Also runnable as: python -m geovault ...
 """
 
 import argparse
+import contextlib
 import sys
 import time
+import warnings
 
 from . import __version__, catalog
 from .sources import REGISTRY
@@ -72,6 +77,28 @@ def _report_open(dataset, say) -> None:
             f"run `geovault compact {dataset}` once nothing holds them")
 
 
+@contextlib.contextmanager
+def _warnings_as_lines():
+    """What the reader warns of (two overpasses on one date, ground left out in another
+    CRS) goes to standard error as plain lines, once the command has run. What libraries
+    warn of about their own future (deprecations) is not shown."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            yield
+        finally:
+            for w in caught:
+                if issubclass(w.category, (UserWarning, RuntimeWarning)):
+                    print(f"warning: {w.message}", file=sys.stderr)
+
+
+def _failed(error) -> int:
+    """A file that could not be read or written: one line on standard error, exit code 2.
+    (1 is the answer "nothing is stored there".)"""
+    print(f"geovault: error: {error}", file=sys.stderr)
+    return 2
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="geovault")
     ap.add_argument("--version", action="version", version=f"geovault {__version__}")
@@ -109,6 +136,39 @@ def main(argv=None):
     p.add_argument("dataset")
     p.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
     p.add_argument("--date")
+
+    p = sub.add_parser("export", help="write the stored pixels of one band and date over an "
+                                      "area as a GeoTIFF, in the CRS they are stored in")
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--band", required=True)
+    p.add_argument("--date", default="",
+                   help="the stored date, or a prefix of it for a composite (2025-07); "
+                        "leave out for a static dataset")
+    p.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
+    p.add_argument("--geojson", help="polygon file; pixels outside the polygon hold no value")
+    p.add_argument("--point", nargs=2, type=float, metavar=("LAT", "LON"),
+                   help="point of interest; combined with --buffer into a small square")
+    p.add_argument("--buffer", type=float, default=250,
+                   help="half-size in meters of the square around --point (default 250)")
+    p.add_argument("--acq", help="the acquisition to read when the date holds several overpasses")
+    p.add_argument("--out", required=True, help="the GeoTIFF to write")
+
+    p = sub.add_parser("series", help="the stored values at a point through time, as CSV")
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--bands", nargs="+", required=True)
+    p.add_argument("--point", nargs=2, type=float, metavar=("LAT", "LON"), required=True)
+    p.add_argument("--date", help="a prefix of the stored dates (2025, 2025-07); default: all")
+    p.add_argument("--out", help="the CSV file to write; default: standard output")
+
+    p = sub.add_parser("verify", help="check that what a dataset holds is whole and that its "
+                                      "catalog lists it; reads only (exit 0 = nothing wrong, 1 = "
+                                      "something is)")
+    p.add_argument("dataset")
+    p.add_argument("--deep", action="store_true",
+                   help="also read every tile and compare it with its row (minutes per 10 GB)")
+    p.add_argument("--date", help="a prefix (2025, 2025-07) that narrows the check to its months")
+    p.add_argument("--workers", type=int, default=8,
+                   help="parts of the store read at once by --deep (default 8)")
 
     p = sub.add_parser("compact", help="seal a dataset's open month part files (and put back a "
                                        "sealed file an interrupted run left aside)")
@@ -173,6 +233,67 @@ def main(argv=None):
             return 0
         for date, band, tiles, cloud in rows:
             print(f"  {date or 'static':>10}  {band:<4} {tiles:>5} tiles  cloud={cloud}")
+        return 0
+
+    if a.cmd == "verify":
+        from .verify import verify
+        t0 = time.time()
+        report = verify(a.dataset, deep=a.deep, date=a.date, workers=a.workers)
+        print(f"{a.dataset}: {report.files} files, {report.tiles} tiles"
+              + (f", {report.read} read" if a.deep else "") + f", {time.time() - t0:.0f}s")
+        for line in report.notes:
+            print(f"  note: {line}")
+        for line in report.problems:
+            print(f"  PROBLEM: {line}")
+        print("nothing wrong found" if report.ok else f"{len(report.problems)} problems")
+        return 0 if report.ok else 1
+
+    if a.cmd == "series":
+        from .export import series_csv
+        lat, lon = a.point
+        with _warnings_as_lines():
+            try:
+                if a.out:
+                    with open(a.out, "w", newline="", encoding="utf-8") as out:
+                        n = series_csv(a.dataset, lon, lat, a.bands, out, a.date)
+                else:
+                    n = series_csv(a.dataset, lon, lat, a.bands, sys.stdout, a.date)
+            except ValueError as exc:               # a dataset or band that is not there
+                ap.error(str(exc))
+            except OSError as exc:
+                if not a.out:                       # the reader of a pipe went away (`| head`)
+                    return 0
+                return _failed(exc)
+        if a.out or not n:
+            print(f"{n} records" + (f" written to {a.out}" if a.out else
+                                    ": nothing is stored at this point"), file=sys.stderr)
+        return 0 if n else 1
+
+    if a.cmd == "export":
+        from rasterio.errors import RasterioError
+        from .export import geotiff
+        if sum(v is not None for v in (a.bbox, a.geojson, a.point)) != 1:
+            ap.error("export needs one of --bbox, --geojson and --point")
+        with _warnings_as_lines():
+            try:
+                aoi = None
+                if a.geojson:
+                    from .aoi import load_geojson
+                    aoi = load_geojson(a.geojson)
+                elif a.point:
+                    from .aoi import point_buffer
+                    aoi = point_buffer(a.point[1], a.point[0], a.buffer)
+                made = geotiff(a.dataset, a.band, a.date, a.out, acq=a.acq, aoi=aoi,
+                               bbox=None if aoi is not None else tuple(a.bbox))
+            except ValueError as exc:               # a name that is not there, an area that is none
+                ap.error(str(exc))
+            except (OSError, RasterioError) as exc:
+                return _failed(exc)
+        if made is None:
+            print(f"nothing written: no tile of {a.dataset} {a.band} {a.date or 'static'} "
+                  f"holds an observation there", file=sys.stderr)
+            return 1
+        print(f"{a.out}: {made[1]} x {made[0]} pixels, {made[2]}")
         return 0
 
     # ingest

@@ -120,6 +120,12 @@ geovault ingest --dataset s2 --bbox 35.30 36.71 35.33 36.73 \
 
 geovault ingest ... --dry-run            # same arguments: report what is still missing, fetch nothing
 geovault coverage s2 --date 2024-06     # what is stored
+
+# pixels out, without Python: a GeoTIFF of an area, a CSV of a point through time
+geovault export --dataset s2 --band B4 --date 2025-07-14 --geojson parcel.geojson --out b4.tif
+geovault series --dataset s2 --bands B4 B8 --point 36.735 35.325 --date 2025 --out point.csv
+
+geovault verify s2                      # is what is stored whole, does the catalog list it (--deep reads every tile)
 geovault compact s2                     # seal open month part files (a finished ingest does this itself)
 geovault reencode agera5                # re-compress stored tiles with the current encoder (lossless)
 geovault rebuild-catalog s2             # regenerate the catalog from the store
@@ -129,6 +135,30 @@ geovault --version
 
 A static dataset (an elevation model, land cover, soil) takes no dates:
 `geovault ingest --dataset gem15 --geojson parcel.geojson`.
+
+`export` writes one band of one date as a GeoTIFF any GIS opens. The area is a
+`--bbox`, a `--geojson` polygon or a `--point` with a `--buffer`. The file is in the CRS
+and on the pixel grid the tiles are stored in, so nothing is resampled; it covers the
+pixels that touch the bounds of the area, as far as tiles are stored there. A pixel
+without a value (a tile that is not stored, nodata in a tile, outside the polygon)
+holds the band's nodata value; a band that has none gets a mask inside the file.
+`--date` is the stored date, or a prefix of it for a composite (`2025-07`), and is left
+out only for a static dataset; `--acq` names the overpass when a date holds two. The
+stored numbers are written as they are, with the scale and offset a source documents
+(Landsat) set on the band. `series` writes the stored values at a point as CSV, to
+`--out` or to standard output: `band, date, value, cloud_pct, acq, crs, scene_id`, one
+line per stored tile at the point, so a date with two overpasses has two lines.
+
+Both exit with 0 when they wrote something, with 1 when nothing is stored there, and
+with 2 for a dataset, band or acquisition that does not exist and for a file that
+cannot be read or written.
+
+`verify` reads only. It checks that every store file opens and can be read, that
+every tile lies in the file of its month, that no tile is stored twice, that no part
+file waits for a compaction and that the catalog lists exactly what the store holds;
+`--deep` also reads every tile and compares it with its row. It exits with 0 when it
+found nothing wrong, and a finding names the command that puts it right where there
+is one (see [Checking a store](docs/storage.md#checking-a-store)).
 
 Re-running an ingest is safe and cheap: stored tiles are skipped via the catalog,
 so the same command serves both the initial backfill and incremental top-ups.
@@ -204,6 +234,14 @@ for rec in series("s2", lon, lat, "B4"):
 from geovault.reader import acquisitions
 for acq in acquisitions("s1", bbox, "VV", "2026-03-01"):      # e.g. morning and evening pass
     arr, transform, crs = mosaic("s1", bbox, "VV", "2026-03-01", acq=acq)
+
+# the same reads written to a file, and a check of what is stored
+from geovault.export import geotiff, series_csv
+from geovault.verify import verify
+geotiff("s2", "B4", "2024-06-03", "b4.tif", bbox=bbox)        # or aoi=<shapely geometry>
+with open("point.csv", "w", newline="") as out:
+    series_csv("s2", lon, lat, ["B4", "B8"], out)
+report = verify("s2", deep=True)                              # report.ok, report.problems
 ```
 
 Points also work on the ingest side; a small square AOI is built around them:

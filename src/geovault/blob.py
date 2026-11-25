@@ -77,6 +77,22 @@ class _NotPlain(Exception):
     """The blob is not laid out as the encoder writes a tile."""
 
 
+class _Cut(_NotPlain):
+    """The blob ends before what its own header says it holds."""
+
+
+class BadTile(ValueError):
+    """A blob that is not a whole tile as the encoder writes one: `check` says why."""
+
+
+# The GeoKeys that hold the EPSG code of a projected and of a geographic CRS, and the
+# value that stands for a CRS without one.
+PROJECTED_CRS, GEOGRAPHIC_CRS, USER_DEFINED = 3072, 2048, 32767
+# No tile is larger than this many bytes of pixels. A header that says otherwise is not
+# read here: it would be asked for memory before a single strip was looked at.
+MAX_PIXEL_BYTES = 1 << 30
+
+
 def decode(blob):
     """One tile blob -> (array, rasterio profile), as rasterio reads the GeoTIFF: band
     1 as a writable array of the tile's data type, and the profile of the dataset."""
@@ -96,6 +112,51 @@ def decode(blob):
         return _pixels(data, fields, layout), Profile(profile, transform=_transform(fields))
     except _NotPlain:           # a damaged tile: GDAL reports what is wrong with it
         return _decode_gdal(data)
+
+
+def check(blob, tile_px=None):
+    """One tile blob read without GDAL, for checking a store: a damaged tile is found
+    here and never handed on, since what GDAL makes of one depends on its build.
+
+    Returns (array, transform, nodata, epsg): the pixels, where the tile lies, the nodata
+    value its header names (None for none) and the EPSG code of its CRS (None for a CRS
+    that has no code). Raises BadTile, saying why, for a blob that is not a TIFF, that
+    ends before what its header says it holds, that is not laid out as the encoder
+    writes a tile, or whose strips do not inflate to the rows they stand for. Every tile
+    of a store comes from the encoder, so another layout is a damaged header or a blob
+    that something else wrote.
+
+    tile_px: the edge of the tile in pixels, when it is known. A tile of another size
+    raises before any of its pixels is read, so a header cannot ask for more memory
+    than a tile of that size takes."""
+    data = bytes(blob)
+    if data[:4] not in (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"):
+        raise BadTile("not a TIFF")
+    try:
+        fields = _fields(data)
+        layout = _layout(fields)
+        transform = _transform(fields)
+        nodata = None
+        if GDAL_NODATA in fields:
+            nodata = float(fields[GDAL_NODATA][2].rstrip(b"\x00").decode("ascii"))
+        keys = _numbers(fields, GEO_KEYS, INTEGERS, ())
+    except _Cut:
+        raise BadTile("cut short: its header names bytes it does not hold") from None
+    except (_NotPlain, ValueError):
+        raise BadTile("not laid out as the encoder writes a tile: a damaged header, or a "
+                      "blob something else wrote") from None
+    _, width, height, _, _ = layout
+    if tile_px is not None and (width, height) != (tile_px, tile_px):
+        raise BadTile(f"{width} x {height} pixels, not {tile_px} x {tile_px}")
+    epsg = None
+    for k in range(4, len(keys) - 3, 4):            # (key, where its value is, count, value)
+        if keys[k] in (PROJECTED_CRS, GEOGRAPHIC_CRS) and keys[k + 1] == 0:
+            if keys[k + 3] != USER_DEFINED and (epsg is None or keys[k] == PROJECTED_CRS):
+                epsg = keys[k + 3]
+    try:
+        return _pixels(data, fields, layout), transform, nodata, epsg
+    except _NotPlain:
+        raise BadTile("its strips do not hold the rows its size calls for") from None
 
 
 def _decode_gdal(data):
@@ -135,7 +196,7 @@ def _fields(data) -> dict:
         entries = struct.unpack_from("<" + "HHI4s" * n, data, at + 2)
         (next_image,) = struct.unpack_from("<I", data, at + 2 + 12 * n)
     except struct.error:
-        raise _NotPlain from None
+        raise _Cut from None
     if next_image:              # an overview or a mask
         raise _NotPlain
     fields = {}
@@ -148,7 +209,7 @@ def _fields(data) -> dict:
             (at,) = struct.unpack("<I", value)
             value = data[at:at + size]
         if len(value) < size:
-            raise _NotPlain
+            raise _Cut
         fields[tag] = (kind, count, value[:size])
     if b"PIXELTYPE" in fields.get(GDAL_METADATA, (2, 0, b""))[2].upper():
         raise _NotPlain
@@ -190,7 +251,8 @@ def _layout(fields) -> tuple:
     width, height = one(WIDTH), one(HEIGHT)
     rows = one(ROWS_PER_STRIP, (height,))
     if (dtype is None or predictor not in (1, 2, 3) or (predictor == 3 and dtype[0] != "f")
-            or min(width, height, rows) < 1):
+            or min(width, height, rows) < 1
+            or width * height * np.dtype(dtype).itemsize > MAX_PIXEL_BYTES):
         raise _NotPlain
     return np.dtype(dtype), width, height, predictor, min(rows, height)
 
